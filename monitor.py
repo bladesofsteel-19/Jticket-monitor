@@ -151,9 +151,10 @@ def get_gspread_client():
     return gc, sh
 
 
-def load_target_urls() -> list[str]:
+def load_target_urls() -> list[tuple[str, str]]:
     """
-    Googleスプレッドシート内の「対象試合」シートのA列からURLを読み込む。
+    Googleスプレッドシート内の「対象試合」シートから (URL, B列のラベル) を読み込む。
+    A列: 試合ページのURL / B列: シート名に使いたいチーム名など(任意)
     シートが無ければ、案内文付きで自動作成する。
     Google Sheets未設定/接続失敗時は、コード内蔵の TARGET_MATCH_URLS にフォールバックする。
     """
@@ -163,9 +164,11 @@ def load_target_urls() -> list[str]:
         print(f"[WARN] Google Sheetsへの接続に失敗したため、内蔵リストを使います: {e}")
         gc, sh = None, None
 
+    fallback = [(u, "") for u in TARGET_MATCH_URLS]
+
     if gc is None or sh is None:
         print("[INFO] Google Sheets未設定のため、コード内蔵のTARGET_MATCH_URLSを使います")
-        return TARGET_MATCH_URLS
+        return fallback
 
     import gspread
 
@@ -173,19 +176,27 @@ def load_target_urls() -> list[str]:
         ws = sh.worksheet(TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=2)
-        ws.update([["ここに試合ページのURLを1行に1つずつ貼ってください(例: https://www.jleague-ticket.jp/sales/perform/xxxxxxx/001)"]])
+        ws.update([[
+            "ここに試合ページのURLを1行に1つずつ貼ってください(例: https://www.jleague-ticket.jp/sales/perform/xxxxxxx/001)",
+            "シート名にしたいチーム名(例: 東京V-柏)",
+        ]])
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートが無かったので新規作成しました。URLを貼ってから再実行してください")
         return []
 
-    values = ws.col_values(1)
-    urls = [v.strip() for v in values if v.strip().startswith("http")]
+    rows = ws.get_all_values()
+    pairs = []
+    for row in rows:
+        url = row[0].strip() if len(row) > 0 else ""
+        label = row[1].strip() if len(row) > 1 else ""
+        if url.startswith("http"):
+            pairs.append((url, label))
 
-    if not urls:
+    if not pairs:
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートにURLが見つからないため、内蔵リストを使います")
-        return TARGET_MATCH_URLS
+        return fallback
 
-    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(urls)}件のURLを読み込みました")
-    return urls
+    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(pairs)}件のURLを読み込みました")
+    return pairs
 
 
 def fetch(url: str) -> str | None:
@@ -204,7 +215,7 @@ def extract_match_meta(html: str, url: str) -> dict:
     # 例: "東京ヴェルディ対柏レイソル　明治安田Ｊ１リーグ(2026/08/14) | Ｊリーグチケット"
     date_match = re.search(r"\((\d{4})/(\d{2})/(\d{2})\)", title)
     match_date = date_match.group(0)[1:-1] if date_match else ""
-    match_mmdd = f"{date_match.group(2)}{date_match.group(3)}" if date_match else ""
+    match_mmdd = f"{int(date_match.group(2))}{date_match.group(3)}" if date_match else ""
 
     raw_card = title.split("(")[0].split("|")[0].strip() if title else ""
     # "明治安田Ｊ１リーグ" 等のリーグ名表記を除去
@@ -287,7 +298,7 @@ def extract_seat_blocks(html: str) -> list[dict]:
     return seats
 
 
-def check_match(url: str) -> list[dict]:
+def check_match(url: str, label: str = "") -> list[dict]:
     html = fetch(url)
     if not html:
         return []
@@ -299,6 +310,7 @@ def check_match(url: str) -> list[dict]:
         rows.append({
             "checked_at": now,
             "card": meta["card"],
+            "sheet_label": label,
             "match_date": meta["match_date"],
             "match_mmdd": meta["match_mmdd"],
             "perform_id": meta["perform_id"],
@@ -327,14 +339,14 @@ def safe_sheet_name(name: str) -> str:
 
 def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
     def fmt(row):
-        base = f"{int(row['price_max']):,}円"
+        base = f"{int(row['price_max']):,}"
         if str(row.get("dynamic")).lower() in ("true", "1"):
             base += "[変動]"
         status = str(row.get("status", ""))
         if status == "完売":
-            base += "(完売)"
+            base += " 完売"
         elif status.startswith("要確認"):
-            base += "(要確認)"
+            base += " 要確認"
         return base
 
     df = df.copy()
@@ -344,12 +356,18 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
-    シート名は「クラブ略称対クラブ略称_mmdd」形式。"""
+    シート名は「対象試合」シートB列のラベル(例: 東京V-柏)を優先し、
+    無ければページから読み取ったcardを使う。日付(mmdd)を末尾に付与する。"""
     pivots = {}
     for perform_id, group in df.groupby("perform_id", dropna=False):
-        card = group["card"].iloc[0]
+        label = ""
+        if "sheet_label" in group.columns:
+            non_empty = [v for v in group["sheet_label"] if str(v).strip()]
+            label = str(non_empty[0]).strip() if non_empty else ""
+        card = label if label else str(group["card"].iloc[0])
+
         mmdd = str(group["match_mmdd"].iloc[0]) if "match_mmdd" in group.columns else ""
-        sheet_label = f"{card}_{mmdd}" if mmdd else str(card)
+        sheet_label = f"{card}_{mmdd}" if mmdd else card
         pivot = group.pivot_table(
             index="checked_at",
             columns="seat_type",
@@ -398,12 +416,12 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
 
 
 def main():
-    target_urls = load_target_urls()
+    targets = load_target_urls()
 
     all_rows = []
-    for url in target_urls:
+    for url, label in targets:
         print(f"[INFO] checking {url}")
-        rows = check_match(url)
+        rows = check_match(url, label)
         all_rows.extend(rows)
         time.sleep(1.5)  # サイト負荷軽減のためのウェイト
 
