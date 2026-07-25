@@ -1,33 +1,35 @@
-name: Jリーグチケット価格チェック
+name: J League ticket price check
 
 on:
   schedule:
-    # 毎日 6:00 JST = 21:00 UTC(前日)
     - cron: "0 21 * * *"
-  workflow_dispatch: {}  # 手動実行用ボタン
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
 
 jobs:
   check-prices:
     runs-on: ubuntu-latest
     steps:
-      - name: リポジトリをチェックアウト
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Python セットアップ
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: 依存パッケージインストール
+      - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: 価格チェック実行
+      - name: Run price check
         run: python monitor.py
 
-      - name: 変更をコミット
+      - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add ticket_prices.csv
-          git diff --quiet --cached || git commit -m "chore: update ticket prices $(date -u +%Y-%m-%d)"
+          git diff --quiet --cached || git commit -m "chore: update ticket prices"
           git push
