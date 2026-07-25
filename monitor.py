@@ -237,7 +237,15 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
     ]
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(sheet_id)
+
+    print(f"[DEBUG] using service account: {creds.service_account_email}")
+    print(f"[DEBUG] target sheet id: {sheet_id!r}")
+
+    try:
+        sh = gc.open_by_key(sheet_id)
+    except gspread.exceptions.APIError as e:
+        print(f"[ERROR] Google Sheets APIエラー詳細: {e.response.text}")
+        raise
 
     for sheet_name, pivot in pivots.items():
         try:
