@@ -231,7 +231,10 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
         print("[WARN] gspread / gspread-dataframe が未インストールのためスキップします")
         return
 
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
     creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
