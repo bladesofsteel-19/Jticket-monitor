@@ -243,8 +243,12 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
 
     try:
         sh = gc.open_by_key(sheet_id)
-    except gspread.exceptions.APIError as e:
-        print(f"[ERROR] Google Sheets APIエラー詳細: {e.response.text}")
+    except PermissionError as e:
+        original = e.__cause__
+        if original is not None and hasattr(original, "response"):
+            print(f"[ERROR] Google Sheets APIエラー詳細: {original.response.text}")
+        else:
+            print(f"[ERROR] 元の例外: {repr(original)}")
         raise
 
     for sheet_name, pivot in pivots.items():
