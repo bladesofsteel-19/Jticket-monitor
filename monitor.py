@@ -10,9 +10,9 @@ CSVに履歴として記録するスクリプト。
   そのため、まずは「対象試合のURLを直接指定する」運用を基本にしています。
   (例: https://www.jleague-ticket.jp/sales/perform/2626898/001)
 - 個別試合ページ (/sales/perform/xxxxxxx/001) は通常のHTTPリクエストで取得できることを確認済みです。
-- 「完売」表示の実際のHTML構造は、完売試合の実例で未確認のため、
-  detect_status() 内のロジックは暫定です。完売中の試合URLが見つかったら
-  そのページのHTMLを見て、SOLD_OUT_PATTERNS を調整してください。
+- 完売判定は「選択する」リンクが表示されているかどうかで行っています。
+  実際の完売中の試合ページ(2625117番)で、完売中の席種には「選択する」が
+  表示されないことを確認済みです。
 """
 
 import csv
@@ -26,6 +26,42 @@ import requests
 from bs4 import BeautifulSoup
 
 JST = timezone(timedelta(hours=9))
+
+# ── クラブのフルネーム → 略称(jleague-ticket.jpの表記に準拠) ──
+CLUB_ABBR = {
+    "鹿島アントラーズ": "鹿島",
+    "水戸ホーリーホック": "水戸",
+    "浦和レッズ": "浦和",
+    "ジェフユナイテッド千葉": "千葉",
+    "ジェフ千葉": "千葉",
+    "柏レイソル": "柏",
+    "ＦＣ東京": "FC東京",
+    "FC東京": "FC東京",
+    "東京ヴェルディ": "東京V",
+    "ＦＣ町田ゼルビア": "町田",
+    "FC町田ゼルビア": "町田",
+    "川崎フロンターレ": "川崎",
+    "横浜Ｆ・マリノス": "横浜FM",
+    "横浜F・マリノス": "横浜FM",
+    "清水エスパルス": "清水",
+    "名古屋グランパス": "名古屋",
+    "京都サンガF.C.": "京都",
+    "ガンバ大阪": "G大阪",
+    "セレッソ大阪": "C大阪",
+    "ヴィッセル神戸": "神戸",
+    "ファジアーノ岡山": "岡山",
+    "サンフレッチェ広島": "広島",
+    "アビスパ福岡": "福岡",
+    "Ｖ・ファーレン長崎": "長崎",
+    "V・ファーレン長崎": "長崎",
+}
+
+
+def abbreviate_card(text: str) -> str:
+    """カード名に含まれるクラブのフルネームを略称に置き換える(マッチしなければそのまま)"""
+    for full, abbr in CLUB_ABBR.items():
+        text = text.replace(full, abbr)
+    return text
 
 # ── J1全20クラブのクラブコード ──────────────────────────────
 J1_CLUBS = {
@@ -51,11 +87,12 @@ J1_CLUBS = {
     "vv": "V・ファーレン長崎",
 }
 
-# ── 監視したい試合URLをここに追加していく運用 ───────────────
-# 自動でクラブページから拾えない場合の暫定リスト。
-# 例: 東京V対柏 (2026/08/14)
+# ── 監視したい試合URL(フォールバック用) ───────────────
+# 通常はGoogleスプレッドシートの「対象試合」シートから読み込む。
+# Google Sheets未設定の場合や、そちらにURLが無い場合に、この内蔵リストが使われる。
 TARGET_MATCH_URLS = [
     "https://www.jleague-ticket.jp/sales/perform/2626898/001",
+    "https://www.jleague-ticket.jp/sales/perform/2625117/001",
 ]
 
 HEADERS = {
@@ -68,9 +105,87 @@ HEADERS = {
 
 OUTPUT_CSV = "ticket_prices.csv"
 OUTPUT_XLSX = "ticket_prices.xlsx"
+TARGETS_SHEET_NAME = "対象試合"
 
 SOLD_OUT_PATTERNS = ["完売", "SOLD OUT", "販売終了"]
-PRICE_PATTERN = re.compile(r"([\d,]+)円\s*[~〜～]\s*([\d,]+)円\s*/\s*枚")
+RANGE_PRICE_PATTERN = re.compile(r"([\d,]+)円\s*[~〜～]\s*([\d,]+)円\s*/\s*枚")
+SINGLE_PRICE_PATTERN = re.compile(r"基本価格[：:]\s*([\d,]+)円\s*/\s*枚")
+SELECT_LINK_TEXT = "選択する"
+
+
+def get_gspread_client():
+    """
+    環境変数からGoogleスプレッドシートに接続する。
+    設定が無い/ライブラリが無い場合は (None, None) を返す(呼び出し側で黙ってスキップする)。
+    """
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    creds_path = os.environ.get("GOOGLE_CREDENTIALS_PATH")
+
+    if not sheet_id or not creds_path or not os.path.isfile(creds_path):
+        return None, None
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+    except ImportError:
+        print("[WARN] gspread が未インストールのためスキップします")
+        return None, None
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    gc = gspread.authorize(creds)
+
+    try:
+        sh = gc.open_by_key(sheet_id)
+    except PermissionError as e:
+        original = e.__cause__
+        if original is not None and hasattr(original, "response"):
+            print(f"[ERROR] Google Sheets APIエラー詳細: {original.response.text}")
+        else:
+            print(f"[ERROR] 元の例外: {repr(original)}")
+        raise
+
+    return gc, sh
+
+
+def load_target_urls() -> list[str]:
+    """
+    Googleスプレッドシート内の「対象試合」シートのA列からURLを読み込む。
+    シートが無ければ、案内文付きで自動作成する。
+    Google Sheets未設定/接続失敗時は、コード内蔵の TARGET_MATCH_URLS にフォールバックする。
+    """
+    try:
+        gc, sh = get_gspread_client()
+    except Exception as e:
+        print(f"[WARN] Google Sheetsへの接続に失敗したため、内蔵リストを使います: {e}")
+        gc, sh = None, None
+
+    if gc is None or sh is None:
+        print("[INFO] Google Sheets未設定のため、コード内蔵のTARGET_MATCH_URLSを使います")
+        return TARGET_MATCH_URLS
+
+    import gspread
+
+    try:
+        ws = sh.worksheet(TARGETS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=2)
+        ws.update([["ここに試合ページのURLを1行に1つずつ貼ってください(例: https://www.jleague-ticket.jp/sales/perform/xxxxxxx/001)"]])
+        print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートが無かったので新規作成しました。URLを貼ってから再実行してください")
+        return []
+
+    values = ws.col_values(1)
+    urls = [v.strip() for v in values if v.strip().startswith("http")]
+
+    if not urls:
+        print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートにURLが見つからないため、内蔵リストを使います")
+        return TARGET_MATCH_URLS
+
+    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(urls)}件のURLを読み込みました")
+    return urls
 
 
 def fetch(url: str) -> str | None:
@@ -87,12 +202,24 @@ def extract_match_meta(html: str, url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     title = soup.title.string.strip() if soup.title and soup.title.string else ""
     # 例: "東京ヴェルディ対柏レイソル　明治安田Ｊ１リーグ(2026/08/14) | Ｊリーグチケット"
-    date_match = re.search(r"\((\d{4}/\d{2}/\d{2})\)", title)
-    match_date = date_match.group(1) if date_match else ""
-    card = title.split("(")[0].split("|")[0].strip() if title else ""
+    date_match = re.search(r"\((\d{4})/(\d{2})/(\d{2})\)", title)
+    match_date = date_match.group(0)[1:-1] if date_match else ""
+    match_mmdd = f"{date_match.group(2)}{date_match.group(3)}" if date_match else ""
+
+    raw_card = title.split("(")[0].split("|")[0].strip() if title else ""
+    # "明治安田Ｊ１リーグ" 等のリーグ名表記を除去
+    raw_card = re.sub(r"明治安田.{0,6}リーグ", "", raw_card).strip()
+    card = abbreviate_card(raw_card)
+
     perform_id_match = re.search(r"/perform/(\d+)/", url)
     perform_id = perform_id_match.group(1) if perform_id_match else ""
-    return {"perform_id": perform_id, "card": card, "match_date": match_date, "url": url}
+    return {
+        "perform_id": perform_id,
+        "card": card,
+        "match_date": match_date,
+        "match_mmdd": match_mmdd,
+        "url": url,
+    }
 
 
 def extract_seat_blocks(html: str) -> list[dict]:
@@ -100,10 +227,10 @@ def extract_seat_blocks(html: str) -> list[dict]:
     ページ全体のテキストから席種ブロックを抽出する。
     各ブロックは概ね次のテキスト構造:
         <席種名見出し>
-        <価格帯>円～<価格帯>円/枚
+        基本価格：<価格>円/枚  または  <最小>円～<最大>円/枚
         発売 情報
         ...(発売期間などが続く)
-        <席種名> 選択する   ← リンクテキスト。ブロックの終端目印
+        <席種名> [選択する]   ← 「選択する」が無い場合は完売
     """
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
@@ -111,27 +238,50 @@ def extract_seat_blocks(html: str) -> list[dict]:
 
     seats = []
     current_name = None
+    block_start = 0
+    BLOCK_NUMBER_RE = re.compile(r"^\d+$")
+
     for i, line in enumerate(lines):
-        price_m = PRICE_PATTERN.search(line)
-        if price_m and current_name:
-            is_dynamic = False
-            # 直前～直後数行に《変動》があれば変動価格対象
-            window = lines[max(0, i - 2): i + 8]
-            if any("変動" in w for w in window):
-                is_dynamic = True
-            status = "販売中"
-            if any(p in w for w in window for p in SOLD_OUT_PATTERNS):
+        range_m = RANGE_PRICE_PATTERN.search(line)
+        single_m = None if range_m else SINGLE_PRICE_PATTERN.search(line)
+
+        if (range_m or single_m) and current_name:
+            if range_m:
+                price_min = range_m.group(1).replace(",", "")
+                price_max = range_m.group(2).replace(",", "")
+            else:
+                price_min = price_max = single_m.group(1).replace(",", "")
+
+            near_window = lines[max(0, i - 2): i + 8]
+            is_dynamic = any("変動" in w for w in near_window)
+
+            # このブロックの範囲は「次の番号行(次の席種の開始)」の手前まで
+            block_end = len(lines)
+            for j in range(i + 1, len(lines)):
+                if BLOCK_NUMBER_RE.match(lines[j]):
+                    block_end = j
+                    break
+            block_window = lines[i:block_end]
+
+            if any(p in w for w in block_window for p in SOLD_OUT_PATTERNS):
                 status = "完売"
+            elif not any(SELECT_LINK_TEXT in w for w in block_window):
+                # 「選択する」リンクが表示されていない = 完売(実例で確認済み)
+                status = "完売"
+            else:
+                status = "販売中"
+
             seats.append({
                 "seat_type": current_name,
-                "price_min": price_m.group(1).replace(",", ""),
-                "price_max": price_m.group(2).replace(",", ""),
+                "price_min": price_min,
+                "price_max": price_max,
                 "dynamic": is_dynamic,
                 "status": status,
             })
             current_name = None
-        elif not price_m and 2 <= len(line) <= 30 and not line.startswith("■") \
-                and "円" not in line and "選択する" not in line and "発売" not in line:
+        elif not range_m and not single_m and 2 <= len(line) <= 30 and not line.startswith("■") \
+                and "円" not in line and "選択する" not in line and "発売" not in line \
+                and "基本価格" not in line:
             # 席種名候補(短い行、価格や発売情報でないもの)
             current_name = line
     return seats
@@ -150,6 +300,7 @@ def check_match(url: str) -> list[dict]:
             "checked_at": now,
             "card": meta["card"],
             "match_date": meta["match_date"],
+            "match_mmdd": meta["match_mmdd"],
             "perform_id": meta["perform_id"],
             "url": meta["url"],
             **seat,
@@ -176,11 +327,14 @@ def safe_sheet_name(name: str) -> str:
 
 def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
     def fmt(row):
-        base = f"{int(row['price_min']):,}円〜{int(row['price_max']):,}円"
+        base = f"{int(row['price_max']):,}円"
         if str(row.get("dynamic")).lower() in ("true", "1"):
             base += "[変動]"
-        if str(row.get("status")) == "完売":
+        status = str(row.get("status", ""))
+        if status == "完売":
             base += "(完売)"
+        elif status.startswith("要確認"):
+            base += "(要確認)"
         return base
 
     df = df.copy()
@@ -189,16 +343,20 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
-    """試合(card)ごとに 行=checked_at, 列=seat_type のピボット表を作る"""
+    """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
+    シート名は「クラブ略称対クラブ略称_mmdd」形式。"""
     pivots = {}
-    for card, group in df.groupby("card", dropna=False):
+    for perform_id, group in df.groupby("perform_id", dropna=False):
+        card = group["card"].iloc[0]
+        mmdd = str(group["match_mmdd"].iloc[0]) if "match_mmdd" in group.columns else ""
+        sheet_label = f"{card}_{mmdd}" if mmdd else str(card)
         pivot = group.pivot_table(
             index="checked_at",
             columns="seat_type",
             values="price_display",
             aggfunc="first",
         )
-        pivots[safe_sheet_name(card)] = pivot
+        pivots[safe_sheet_name(sheet_label)] = pivot
     return pivots
 
 
@@ -216,40 +374,17 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
     環境変数 GOOGLE_SHEET_ID と GOOGLE_CREDENTIALS_PATH が設定されている場合のみ、
     Googleスプレッドシートへ書き出す。未設定なら黙ってスキップする。
     """
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
-    creds_path = os.environ.get("GOOGLE_CREDENTIALS_PATH")
-
-    if not sheet_id or not creds_path or not os.path.isfile(creds_path):
-        print("[INFO] Google Sheets連携は未設定のためスキップします")
-        return
-
     try:
         import gspread
-        from google.oauth2.service_account import Credentials
         from gspread_dataframe import set_with_dataframe
     except ImportError:
         print("[WARN] gspread / gspread-dataframe が未インストールのためスキップします")
         return
 
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    print(f"[DEBUG] using service account: {creds.service_account_email}")
-    print(f"[DEBUG] target sheet id: {sheet_id!r}")
-
-    try:
-        sh = gc.open_by_key(sheet_id)
-    except PermissionError as e:
-        original = e.__cause__
-        if original is not None and hasattr(original, "response"):
-            print(f"[ERROR] Google Sheets APIエラー詳細: {original.response.text}")
-        else:
-            print(f"[ERROR] 元の例外: {repr(original)}")
-        raise
+    gc, sh = get_gspread_client()
+    if gc is None or sh is None:
+        print("[INFO] Google Sheets連携は未設定のためスキップします")
+        return
 
     for sheet_name, pivot in pivots.items():
         try:
@@ -259,12 +394,14 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
         ws.clear()
         set_with_dataframe(ws, pivot.reset_index())
 
-    print(f"[INFO] Googleスプレッドシート({sheet_id})に書き出しました")
+    print(f"[INFO] Googleスプレッドシートに書き出しました")
 
 
 def main():
+    target_urls = load_target_urls()
+
     all_rows = []
-    for url in TARGET_MATCH_URLS:
+    for url in target_urls:
         print(f"[INFO] checking {url}")
         rows = check_match(url)
         all_rows.extend(rows)
