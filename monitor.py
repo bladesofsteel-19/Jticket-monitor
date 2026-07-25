@@ -21,6 +21,7 @@ import re
 import time
 from datetime import datetime, timezone, timedelta
 
+import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
@@ -66,6 +67,7 @@ HEADERS = {
 }
 
 OUTPUT_CSV = "ticket_prices.csv"
+OUTPUT_XLSX = "ticket_prices.xlsx"
 
 SOLD_OUT_PATTERNS = ["完売", "SOLD OUT", "販売終了"]
 PRICE_PATTERN = re.compile(r"([\d,]+)円\s*[~〜～]\s*([\d,]+)円\s*/\s*枚")
@@ -166,6 +168,85 @@ def append_csv(rows: list[dict]):
         writer.writerows(rows)
 
 
+def safe_sheet_name(name: str) -> str:
+    """Excelのシート名で使えない文字を除去し31文字に収める"""
+    cleaned = re.sub(r'[\\/*?:\[\]]', '_', str(name)).strip()
+    return (cleaned or "sheet")[:31]
+
+
+def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
+    def fmt(row):
+        base = f"{int(row['price_min']):,}円〜{int(row['price_max']):,}円"
+        if str(row.get("dynamic")).lower() in ("true", "1"):
+            base += "[変動]"
+        if str(row.get("status")) == "完売":
+            base += "(完売)"
+        return base
+
+    df = df.copy()
+    df["price_display"] = df.apply(fmt, axis=1)
+    return df
+
+
+def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """試合(card)ごとに 行=checked_at, 列=seat_type のピボット表を作る"""
+    pivots = {}
+    for card, group in df.groupby("card", dropna=False):
+        pivot = group.pivot_table(
+            index="checked_at",
+            columns="seat_type",
+            values="price_display",
+            aggfunc="first",
+        )
+        pivots[safe_sheet_name(card)] = pivot
+    return pivots
+
+
+def export_pivot_xlsx(pivots: dict[str, pd.DataFrame]):
+    if not pivots:
+        return
+    with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
+        for sheet_name, pivot in pivots.items():
+            pivot.to_excel(writer, sheet_name=sheet_name)
+    print(f"[INFO] {OUTPUT_XLSX} を出力しました")
+
+
+def export_google_sheets(pivots: dict[str, pd.DataFrame]):
+    """
+    環境変数 GOOGLE_SHEET_ID と GOOGLE_CREDENTIALS_PATH が設定されている場合のみ、
+    Googleスプレッドシートへ書き出す。未設定なら黙ってスキップする。
+    """
+    sheet_id = os.environ.get("GOOGLE_SHEET_ID")
+    creds_path = os.environ.get("GOOGLE_CREDENTIALS_PATH")
+
+    if not sheet_id or not creds_path or not os.path.isfile(creds_path):
+        print("[INFO] Google Sheets連携は未設定のためスキップします")
+        return
+
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        from gspread_dataframe import set_with_dataframe
+    except ImportError:
+        print("[WARN] gspread / gspread-dataframe が未インストールのためスキップします")
+        return
+
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(sheet_id)
+
+    for sheet_name, pivot in pivots.items():
+        try:
+            ws = sh.worksheet(sheet_name)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=sheet_name, rows=200, cols=50)
+        ws.clear()
+        set_with_dataframe(ws, pivot.reset_index())
+
+    print(f"[INFO] Googleスプレッドシート({sheet_id})に書き出しました")
+
+
 def main():
     all_rows = []
     for url in TARGET_MATCH_URLS:
@@ -176,6 +257,18 @@ def main():
 
     append_csv(all_rows)
     print(f"[INFO] {len(all_rows)}件を {OUTPUT_CSV} に追記しました")
+
+    if not os.path.isfile(OUTPUT_CSV):
+        return
+
+    full_df = pd.read_csv(OUTPUT_CSV, encoding="utf-8-sig")
+    if full_df.empty:
+        return
+    full_df = build_price_display(full_df)
+    pivots = build_pivots(full_df)
+
+    export_pivot_xlsx(pivots)
+    export_google_sheets(pivots)
 
 
 if __name__ == "__main__":
