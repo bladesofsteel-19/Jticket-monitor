@@ -341,7 +341,7 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
     def fmt(row):
         base = f"{int(row['price_max']):,}"
         if str(row.get("dynamic")).lower() in ("true", "1"):
-            base += "[変動]"
+            base += " [変動]"
         status = str(row.get("status", ""))
         if status == "完売":
             base += " 完売"
@@ -356,15 +356,11 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
-    シート名は「対象試合」シートB列のラベル(例: 東京V-柏)を優先し、
-    無ければページから読み取ったcardを使う。日付(mmdd)を末尾に付与する。"""
+    シート名は常にページから自動判定した両チーム名(card)を使う(例: 東京V-水戸)。
+    「対象試合」シートのB/C列は参考情報として記録されるが、シート名には使わない。"""
     pivots = {}
     for perform_id, group in df.groupby("perform_id", dropna=False):
-        label = ""
-        if "sheet_label" in group.columns:
-            non_empty = [v for v in group["sheet_label"] if str(v).strip()]
-            label = str(non_empty[0]).strip() if non_empty else ""
-        card = label if label else str(group["card"].iloc[0])
+        card = str(group["card"].iloc[0]).replace("対", "-")
 
         mmdd = str(group["match_mmdd"].iloc[0]) if "match_mmdd" in group.columns else ""
         sheet_label = f"{card}_{mmdd}" if mmdd else card
