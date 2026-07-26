@@ -478,18 +478,14 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
     try:
         all_ws = sh.worksheets()
         name_to_ws = {w.title: w for w in all_ws}
-        ordered = []
-        if TARGETS_SHEET_NAME in name_to_ws:
-            ordered.append(name_to_ws[TARGETS_SHEET_NAME])
-        for name in pivots.keys():
-            if name in name_to_ws and name_to_ws[name] not in ordered:
-                ordered.append(name_to_ws[name])
-        # 上記に含まれない既存シートは末尾にそのまま残す(取りこぼし防止)
-        for w in all_ws:
-            if w not in ordered:
-                ordered.append(w)
+
+        # 試合ピボット以外のシート(「対象試合」「マニュアル」など)は元の相対位置のまま維持する
+        base_order = [w for w in all_ws if w.title not in pivots]
+        match_ws_sorted = [name_to_ws[name] for name in pivots.keys() if name in name_to_ws]
+
+        ordered = base_order + match_ws_sorted
         sh.reorder_worksheets(ordered)
-        print("[INFO] シートの並び順を試合開催日順に揃えました")
+        print("[INFO] 試合シートのみ開催日順に並び替えました(それ以外のシートは動かしていません)")
     except Exception as e:
         print(f"[WARN] シートの並び替えに失敗しました: {e}")
 
