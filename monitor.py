@@ -358,8 +358,8 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
-    シート名は「対象試合」シートB列(sheet_label)があればそれを優先し、
-    無い場合のみページから自動判定したcardを使う(表記ゆれで略称化に失敗する場合があるため)。"""
+    シート名は「自動判定したホーム側の略称」+「B列(相手チームの略称)」を組み合わせる。
+    (B列は片方=相手チームの略称のみが入っている前提)"""
     pivots = {}
     for perform_id, group in df.groupby("perform_id", dropna=False):
         label = ""
@@ -367,7 +367,10 @@ def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
             non_empty = [v for v in group["sheet_label"] if str(v).strip()]
             label = str(non_empty[0]).strip() if non_empty else ""
 
-        card = label if label else str(group["card"].iloc[0]).replace("対", "-")
+        auto_card = str(group["card"].iloc[0]).replace("対", "-")
+        home_part = auto_card.split("-")[0] if "-" in auto_card else auto_card
+
+        card = f"{home_part}-{label}" if label else auto_card
 
         mmdd = str(group["match_mmdd"].iloc[0]) if "match_mmdd" in group.columns else ""
         sheet_label = f"{card}_{mmdd}" if mmdd else card
