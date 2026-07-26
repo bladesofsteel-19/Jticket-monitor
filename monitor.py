@@ -46,6 +46,8 @@ CLUB_ABBR = {
     "清水エスパルス": "清水",
     "名古屋グランパス": "名古屋",
     "京都サンガF.C.": "京都",
+    "京都サンガＦ．Ｃ．": "京都",
+    "京都サンガFC": "京都",
     "ガンバ大阪": "G大阪",
     "セレッソ大阪": "C大阪",
     "ヴィッセル神戸": "神戸",
@@ -356,11 +358,16 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
-    シート名は常にページから自動判定した両チーム名(card)を使う(例: 東京V-水戸)。
-    「対象試合」シートのB/C列は参考情報として記録されるが、シート名には使わない。"""
+    シート名は「対象試合」シートB列(sheet_label)があればそれを優先し、
+    無い場合のみページから自動判定したcardを使う(表記ゆれで略称化に失敗する場合があるため)。"""
     pivots = {}
     for perform_id, group in df.groupby("perform_id", dropna=False):
-        card = str(group["card"].iloc[0]).replace("対", "-")
+        label = ""
+        if "sheet_label" in group.columns:
+            non_empty = [v for v in group["sheet_label"] if str(v).strip()]
+            label = str(non_empty[0]).strip() if non_empty else ""
+
+        card = label if label else str(group["card"].iloc[0]).replace("対", "-")
 
         mmdd = str(group["match_mmdd"].iloc[0]) if "match_mmdd" in group.columns else ""
         sheet_label = f"{card}_{mmdd}" if mmdd else card
