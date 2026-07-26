@@ -284,10 +284,15 @@ def extract_seat_blocks(html: str) -> list[dict]:
 
     seats = []
     current_name = None
-    block_start = 0
+    current_order = None
+    last_number = None
     BLOCK_NUMBER_RE = re.compile(r"^\d+$")
 
     for i, line in enumerate(lines):
+        if BLOCK_NUMBER_RE.match(line):
+            last_number = int(line)
+            continue
+
         range_m = RANGE_PRICE_PATTERN.search(line)
         single_m = None if range_m else SINGLE_PRICE_PATTERN.search(line)
 
@@ -319,17 +324,20 @@ def extract_seat_blocks(html: str) -> list[dict]:
 
             seats.append({
                 "seat_type": current_name,
+                "seat_order": current_order if current_order is not None else 9999,
                 "price_min": price_min,
                 "price_max": price_max,
                 "dynamic": is_dynamic,
                 "status": status,
             })
             current_name = None
+            current_order = None
         elif not range_m and not single_m and 2 <= len(line) <= 30 and not line.startswith("■") \
                 and "円" not in line and "選択する" not in line and "発売" not in line \
                 and "基本価格" not in line:
             # 席種名候補(短い行、価格や発売情報でないもの)
             current_name = line
+            current_order = last_number
     return seats
 
 
@@ -338,7 +346,7 @@ def check_match(url: str) -> list[dict]:
     if not html:
         return []
     meta = extract_match_meta(html, url)
-    seats = extract_seat_blocks(html)
+    seats = extract_seat_blocks(html)  # 各seatにseat_orderを含む
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
     rows = []
     for seat in seats:
@@ -391,9 +399,23 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
 def build_pivots(df: pd.DataFrame, abbr_map: dict | None = None) -> dict[str, pd.DataFrame]:
     """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
     シート名は raw_card(ページから読み取った両チームのフルネーム)を、
-    クラブ略称変換表(内蔵 + スプレッドシートのB/C列)で略称化して作る。"""
+    クラブ略称変換表(内蔵 + スプレッドシートのB/C列)で略称化して作る。
+    シートの並び順は試合開催日(match_date)の昇順、列(席種)はサイト表示の番号(seat_order)順にする。
+    """
+    groups = list(df.groupby("perform_id", dropna=False))
+
+    def match_sort_key(item):
+        _, group = item
+        d = str(group["match_date"].iloc[0]) if "match_date" in group.columns else ""
+        try:
+            return pd.to_datetime(d, format="%Y/%m/%d")
+        except (ValueError, TypeError):
+            return pd.Timestamp.max
+
+    groups.sort(key=match_sort_key)
+
     pivots = {}
-    for perform_id, group in df.groupby("perform_id", dropna=False):
+    for perform_id, group in groups:
         raw_card = str(group["raw_card"].iloc[0]) if "raw_card" in group.columns else ""
         card = abbreviate_text(raw_card, abbr_map).replace("対", "-")
 
@@ -405,6 +427,13 @@ def build_pivots(df: pd.DataFrame, abbr_map: dict | None = None) -> dict[str, pd
             values="price_display",
             aggfunc="first",
         )
+
+        if "seat_order" in group.columns:
+            order_map = group.groupby("seat_type")["seat_order"].min()
+            ordered_cols = [c for c in order_map.sort_values().index.tolist() if c in pivot.columns]
+            if ordered_cols:
+                pivot = pivot[ordered_cols]
+
         pivots[safe_sheet_name(sheet_label)] = pivot
     return pivots
 
@@ -444,6 +473,25 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
         set_with_dataframe(ws, pivot.reset_index())
 
     print(f"[INFO] Googleスプレッドシートに書き出しました")
+
+    # タブの並び順を試合開催日順(pivotsの順)に揃える
+    try:
+        all_ws = sh.worksheets()
+        name_to_ws = {w.title: w for w in all_ws}
+        ordered = []
+        if TARGETS_SHEET_NAME in name_to_ws:
+            ordered.append(name_to_ws[TARGETS_SHEET_NAME])
+        for name in pivots.keys():
+            if name in name_to_ws and name_to_ws[name] not in ordered:
+                ordered.append(name_to_ws[name])
+        # 上記に含まれない既存シートは末尾にそのまま残す(取りこぼし防止)
+        for w in all_ws:
+            if w not in ordered:
+                ordered.append(w)
+        sh.reorder_worksheets(ordered)
+        print("[INFO] シートの並び順を試合開催日順に揃えました")
+    except Exception as e:
+        print(f"[WARN] シートの並び替えに失敗しました: {e}")
 
 
 def main():
