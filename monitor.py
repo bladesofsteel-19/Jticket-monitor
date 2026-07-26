@@ -59,11 +59,6 @@ CLUB_ABBR = {
 }
 
 
-def abbreviate_card(text: str) -> str:
-    """カード名に含まれるクラブのフルネームを略称に置き換える(マッチしなければそのまま)"""
-    for full, abbr in CLUB_ABBR.items():
-        text = text.replace(full, abbr)
-    return text
 
 # ── J1全20クラブのクラブコード ──────────────────────────────
 J1_CLUBS = {
@@ -153,10 +148,9 @@ def get_gspread_client():
     return gc, sh
 
 
-def load_target_urls() -> list[tuple[str, str]]:
+def load_target_urls() -> list[str]:
     """
-    Googleスプレッドシート内の「対象試合」シートから (URL, B列のラベル) を読み込む。
-    A列: 試合ページのURL / B列: シート名に使いたいチーム名など(任意)
+    Googleスプレッドシート内の「対象試合」シートのA列からURLを読み込む。
     シートが無ければ、案内文付きで自動作成する。
     Google Sheets未設定/接続失敗時は、コード内蔵の TARGET_MATCH_URLS にフォールバックする。
     """
@@ -166,39 +160,79 @@ def load_target_urls() -> list[tuple[str, str]]:
         print(f"[WARN] Google Sheetsへの接続に失敗したため、内蔵リストを使います: {e}")
         gc, sh = None, None
 
-    fallback = [(u, "") for u in TARGET_MATCH_URLS]
-
     if gc is None or sh is None:
         print("[INFO] Google Sheets未設定のため、コード内蔵のTARGET_MATCH_URLSを使います")
-        return fallback
+        return TARGET_MATCH_URLS
 
     import gspread
 
     try:
         ws = sh.worksheet(TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=2)
+        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=3)
         ws.update([[
-            "ここに試合ページのURLを1行に1つずつ貼ってください(例: https://www.jleague-ticket.jp/sales/perform/xxxxxxx/001)",
-            "シート名にしたいチーム名(例: 東京V-柏)",
+            "URL(試合ページ)",
+            "略称",
+            "クラブのフルネーム",
         ]])
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートが無かったので新規作成しました。URLを貼ってから再実行してください")
         return []
 
-    rows = ws.get_all_values()
-    pairs = []
-    for row in rows:
-        url = row[0].strip() if len(row) > 0 else ""
-        label = row[1].strip() if len(row) > 1 else ""
-        if url.startswith("http"):
-            pairs.append((url, label))
+    values = ws.col_values(1)
+    urls = [v.strip() for v in values if v.strip().startswith("http")]
 
-    if not pairs:
+    if not urls:
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートにURLが見つからないため、内蔵リストを使います")
-        return fallback
+        return TARGET_MATCH_URLS
 
-    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(pairs)}件のURLを読み込みました")
-    return pairs
+    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(urls)}件のURLを読み込みました")
+    return urls
+
+
+def load_club_abbr_map() -> dict:
+    """
+    「対象試合」シートのB列(略称)・C列(クラブのフルネーム)を、行の対応関係なく
+    シート全体から読み込み、{フルネーム: 略称} の変換表として使う。
+    A列のURLとは無関係(あくまでクラブ名の変換表として全行分をまとめて読む)。
+    """
+    try:
+        gc, sh = get_gspread_client()
+    except Exception as e:
+        print(f"[WARN] クラブ略称マップの読み込みに失敗したため内蔵の変換表のみ使います: {e}")
+        return {}
+
+    if gc is None or sh is None:
+        return {}
+
+    import gspread
+
+    try:
+        ws = sh.worksheet(TARGETS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        return {}
+
+    rows = ws.get_all_values()
+    mapping = {}
+    for row in rows:
+        abbr = row[1].strip() if len(row) > 1 else ""
+        full = row[2].strip() if len(row) > 2 else ""
+        if abbr and full:
+            mapping[full] = abbr
+
+    if mapping:
+        print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートのB/C列から{len(mapping)}件のクラブ略称を読み込みました")
+    return mapping
+
+
+def abbreviate_text(text: str, extra_map: dict | None = None) -> str:
+    """テキスト中のクラブのフルネームを略称に置き換える。内蔵の変換表(CLUB_ABBR)に加え、
+    Googleスプレッドシート由来の変換表(extra_map)があればそちらを優先して適用する。"""
+    mapping = dict(CLUB_ABBR)
+    if extra_map:
+        mapping.update(extra_map)  # スプレッドシート側の指定を優先
+    for full, abbr in mapping.items():
+        text = text.replace(full, abbr)
+    return text
 
 
 def fetch(url: str) -> str | None:
@@ -222,13 +256,12 @@ def extract_match_meta(html: str, url: str) -> dict:
     raw_card = title.split("(")[0].split("|")[0].strip() if title else ""
     # "明治安田Ｊ１リーグ" 等のリーグ名表記を除去
     raw_card = re.sub(r"明治安田.{0,6}リーグ", "", raw_card).strip()
-    card = abbreviate_card(raw_card)
 
     perform_id_match = re.search(r"/perform/(\d+)/", url)
     perform_id = perform_id_match.group(1) if perform_id_match else ""
     return {
         "perform_id": perform_id,
-        "card": card,
+        "raw_card": raw_card,
         "match_date": match_date,
         "match_mmdd": match_mmdd,
         "url": url,
@@ -300,7 +333,7 @@ def extract_seat_blocks(html: str) -> list[dict]:
     return seats
 
 
-def check_match(url: str, label: str = "") -> list[dict]:
+def check_match(url: str) -> list[dict]:
     html = fetch(url)
     if not html:
         return []
@@ -311,8 +344,7 @@ def check_match(url: str, label: str = "") -> list[dict]:
     for seat in seats:
         rows.append({
             "checked_at": now,
-            "card": meta["card"],
-            "sheet_label": label,
+            "raw_card": meta["raw_card"],
             "match_date": meta["match_date"],
             "match_mmdd": meta["match_mmdd"],
             "perform_id": meta["perform_id"],
@@ -356,21 +388,14 @@ def build_price_display(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def build_pivots(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+def build_pivots(df: pd.DataFrame, abbr_map: dict | None = None) -> dict[str, pd.DataFrame]:
     """試合(perform_id)ごとに 行=checked_at, 列=seat_type のピボット表を作る。
-    シート名は「自動判定したホーム側の略称」+「B列(相手チームの略称)」を組み合わせる。
-    (B列は片方=相手チームの略称のみが入っている前提)"""
+    シート名は raw_card(ページから読み取った両チームのフルネーム)を、
+    クラブ略称変換表(内蔵 + スプレッドシートのB/C列)で略称化して作る。"""
     pivots = {}
     for perform_id, group in df.groupby("perform_id", dropna=False):
-        label = ""
-        if "sheet_label" in group.columns:
-            non_empty = [v for v in group["sheet_label"] if str(v).strip()]
-            label = str(non_empty[0]).strip() if non_empty else ""
-
-        auto_card = str(group["card"].iloc[0]).replace("対", "-")
-        home_part = auto_card.split("-")[0] if "-" in auto_card else auto_card
-
-        card = f"{home_part}-{label}" if label else auto_card
+        raw_card = str(group["raw_card"].iloc[0]) if "raw_card" in group.columns else ""
+        card = abbreviate_text(raw_card, abbr_map).replace("対", "-")
 
         mmdd = str(group["match_mmdd"].iloc[0]) if "match_mmdd" in group.columns else ""
         sheet_label = f"{card}_{mmdd}" if mmdd else card
@@ -422,12 +447,12 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
 
 
 def main():
-    targets = load_target_urls()
+    urls = load_target_urls()
 
     all_rows = []
-    for url, label in targets:
+    for url in urls:
         print(f"[INFO] checking {url}")
-        rows = check_match(url, label)
+        rows = check_match(url)
         all_rows.extend(rows)
         time.sleep(1.5)  # サイト負荷軽減のためのウェイト
 
@@ -441,7 +466,9 @@ def main():
     if full_df.empty:
         return
     full_df = build_price_display(full_df)
-    pivots = build_pivots(full_df)
+
+    abbr_map = load_club_abbr_map()
+    pivots = build_pivots(full_df, abbr_map)
 
     export_pivot_xlsx(pivots)
     export_google_sheets(pivots)
