@@ -1,8 +1,6 @@
 name: J League ticket price check
 
 on:
-  schedule:
-    - cron: "0 21 * * *"
   workflow_dispatch: {}
 
 permissions:
