@@ -148,9 +148,10 @@ def get_gspread_client():
     return gc, sh
 
 
-def load_target_urls() -> list[str]:
+def load_target_urls() -> list[tuple[int, str]]:
     """
     Googleスプレッドシート内の「対象試合」シートのA列からURLを読み込む。
+    戻り値は (シート上の行番号, URL) のリスト(行番号はD/E列への結果書き戻しに使う)。
     シートが無ければ、案内文付きで自動作成する。
     Google Sheets未設定/接続失敗時は、コード内蔵の TARGET_MATCH_URLS にフォールバックする。
     """
@@ -160,18 +161,22 @@ def load_target_urls() -> list[str]:
         print(f"[WARN] Google Sheetsへの接続に失敗したため、内蔵リストを使います: {e}")
         gc, sh = None, None
 
+    fallback = [(0, u) for u in TARGET_MATCH_URLS]
+
     if gc is None or sh is None:
         print("[INFO] Google Sheets未設定のため、コード内蔵のTARGET_MATCH_URLSを使います")
-        return TARGET_MATCH_URLS
+        return fallback
 
     import gspread
 
     try:
         ws = sh.worksheet(TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=3)
+        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=5)
         ws.update([[
             "URL(試合ページ)",
+            "対戦カード(自動入力)",
+            "開催日(自動入力)",
             "略称",
             "クラブのフルネーム",
         ]])
@@ -179,19 +184,56 @@ def load_target_urls() -> list[str]:
         return []
 
     values = ws.col_values(1)
-    urls = [v.strip() for v in values if v.strip().startswith("http")]
+    pairs = [(i + 1, v.strip()) for i, v in enumerate(values) if v.strip().startswith("http")]
 
-    if not urls:
+    if not pairs:
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートにURLが見つからないため、内蔵リストを使います")
-        return TARGET_MATCH_URLS
+        return fallback
 
-    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(urls)}件のURLを読み込みました")
-    return urls
+    print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートから{len(pairs)}件のURLを読み込みました")
+    return pairs
+
+
+def update_target_row_info(row_updates: list[tuple[int, str, str]]):
+    """
+    「対象試合」シートのD列(対戦カード)・E列(開催日)に、実際に取得できた内容を書き戻す。
+    row_updates: [(行番号, 対戦カード, 開催日), ...]
+    Google Sheets未設定時や行番号が無い(内蔵リスト使用時)は何もしない。
+    """
+    row_updates = [r for r in row_updates if r[0] > 0]
+    if not row_updates:
+        return
+
+    try:
+        gc, sh = get_gspread_client()
+    except Exception as e:
+        print(f"[WARN] D/E列の書き戻しに失敗しました: {e}")
+        return
+
+    if gc is None or sh is None:
+        return
+
+    import gspread
+
+    try:
+        ws = sh.worksheet(TARGETS_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        return
+
+    try:
+        cells = []
+        for row, card, date in row_updates:
+            cells.append(gspread.Cell(row=row, col=2, value=card))
+            cells.append(gspread.Cell(row=row, col=3, value=date))
+        ws.update_cells(cells)
+        print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートのD/E列を{len(row_updates)}行分更新しました")
+    except Exception as e:
+        print(f"[WARN] D/E列の書き戻しに失敗しました: {e}")
 
 
 def load_club_abbr_map() -> dict:
     """
-    「対象試合」シートのB列(略称)・C列(クラブのフルネーム)を、行の対応関係なく
+    「対象試合」シートのD列(略称)・E列(クラブのフルネーム)を、行の対応関係なく
     シート全体から読み込み、{フルネーム: 略称} の変換表として使う。
     A列のURLとは無関係(あくまでクラブ名の変換表として全行分をまとめて読む)。
     """
@@ -214,8 +256,8 @@ def load_club_abbr_map() -> dict:
     rows = ws.get_all_values()
     mapping = {}
     for row in rows:
-        abbr = row[1].strip() if len(row) > 1 else ""
-        full = row[2].strip() if len(row) > 2 else ""
+        abbr = row[3].strip() if len(row) > 3 else ""
+        full = row[4].strip() if len(row) > 4 else ""
         if abbr and full:
             mapping[full] = abbr
 
@@ -491,14 +533,23 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
 
 
 def main():
-    urls = load_target_urls()
+    targets = load_target_urls()
+    abbr_map = load_club_abbr_map()
 
     all_rows = []
-    for url in urls:
+    row_updates = []
+    for row_num, url in targets:
         print(f"[INFO] checking {url}")
         rows = check_match(url)
         all_rows.extend(rows)
+        if rows:
+            raw_card = rows[0].get("raw_card", "")
+            match_date = rows[0].get("match_date", "")
+            display_card = abbreviate_text(raw_card, abbr_map).replace("対", "-")
+            row_updates.append((row_num, display_card, match_date))
         time.sleep(1.5)  # サイト負荷軽減のためのウェイト
+
+    update_target_row_info(row_updates)
 
     append_csv(all_rows)
     print(f"[INFO] {len(all_rows)}件を {OUTPUT_CSV} に追記しました")
@@ -511,7 +562,6 @@ def main():
         return
     full_df = build_price_display(full_df)
 
-    abbr_map = load_club_abbr_map()
     pivots = build_pivots(full_df, abbr_map)
 
     export_pivot_xlsx(pivots)
