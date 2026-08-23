@@ -110,6 +110,33 @@ SINGLE_PRICE_PATTERN = re.compile(r"基本価格[：:]\s*([\d,]+)円\s*/\s*枚")
 SELECT_LINK_TEXT = "選択する"
 
 
+def retry_on_transient_error(func, *args, max_attempts=4, base_delay=5, **kwargs):
+    """
+    一時的なエラー(503など)が起きた場合、少し待って自動で再試行する。
+    最終的にダメだった場合は、そのまま例外を投げる(呼び出し側で通常通り扱われる)。
+    """
+    import gspread
+
+    TRANSIENT_STATUS_CODES = {429, 500, 502, 503, 504}
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return func(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = None
+            try:
+                status = e.response.status_code
+            except Exception:
+                pass
+
+            if status in TRANSIENT_STATUS_CODES and attempt < max_attempts:
+                wait = base_delay * attempt
+                print(f"[WARN] Google Sheets APIが一時的にエラー(status={status})。{wait}秒待って再試行します({attempt}/{max_attempts})")
+                time.sleep(wait)
+                continue
+            raise
+
+
 def get_gspread_client():
     """
     環境変数からGoogleスプレッドシートに接続する。
@@ -136,7 +163,7 @@ def get_gspread_client():
     gc = gspread.authorize(creds)
 
     try:
-        sh = gc.open_by_key(sheet_id)
+        sh = retry_on_transient_error(gc.open_by_key, sheet_id)
     except PermissionError as e:
         original = e.__cause__
         if original is not None and hasattr(original, "response"):
@@ -170,7 +197,7 @@ def load_target_urls() -> list[tuple[int, str]]:
     import gspread
 
     try:
-        ws = sh.worksheet(TARGETS_SHEET_NAME)
+        ws = retry_on_transient_error(sh.worksheet, TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=5)
         ws.update([[
@@ -183,7 +210,7 @@ def load_target_urls() -> list[tuple[int, str]]:
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートが無かったので新規作成しました。URLを貼ってから再実行してください")
         return []
 
-    values = ws.col_values(1)
+    values = retry_on_transient_error(ws.col_values, 1)
     pairs = [(i + 1, v.strip()) for i, v in enumerate(values) if v.strip().startswith("http")]
 
     if not pairs:
@@ -216,7 +243,7 @@ def update_target_row_info(row_updates: list[tuple[int, str, str]]):
     import gspread
 
     try:
-        ws = sh.worksheet(TARGETS_SHEET_NAME)
+        ws = retry_on_transient_error(sh.worksheet, TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
         return
 
@@ -225,7 +252,7 @@ def update_target_row_info(row_updates: list[tuple[int, str, str]]):
         for row, card, date in row_updates:
             cells.append(gspread.Cell(row=row, col=2, value=card))
             cells.append(gspread.Cell(row=row, col=3, value=date))
-        ws.update_cells(cells)
+        retry_on_transient_error(ws.update_cells, cells)
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートのD/E列を{len(row_updates)}行分更新しました")
     except Exception as e:
         print(f"[WARN] D/E列の書き戻しに失敗しました: {e}")
@@ -249,11 +276,11 @@ def load_club_abbr_map() -> dict:
     import gspread
 
     try:
-        ws = sh.worksheet(TARGETS_SHEET_NAME)
+        ws = retry_on_transient_error(sh.worksheet, TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
         return {}
 
-    rows = ws.get_all_values()
+    rows = retry_on_transient_error(ws.get_all_values)
     mapping = {}
     for row in rows:
         abbr = row[3].strip() if len(row) > 3 else ""
@@ -508,17 +535,17 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
 
     for sheet_name, pivot in pivots.items():
         try:
-            ws = sh.worksheet(sheet_name)
+            ws = retry_on_transient_error(sh.worksheet, sheet_name)
         except gspread.WorksheetNotFound:
             ws = sh.add_worksheet(title=sheet_name, rows=200, cols=50)
-        ws.clear()
-        set_with_dataframe(ws, pivot.reset_index())
+        retry_on_transient_error(ws.clear)
+        retry_on_transient_error(set_with_dataframe, ws, pivot.reset_index())
 
     print(f"[INFO] Googleスプレッドシートに書き出しました")
 
     # タブの並び順を試合開催日順(pivotsの順)に揃える
     try:
-        all_ws = sh.worksheets()
+        all_ws = retry_on_transient_error(sh.worksheets)
         name_to_ws = {w.title: w for w in all_ws}
 
         # 試合ピボット以外のシート(「対象試合」「マニュアル」など)は元の相対位置のまま維持する
@@ -526,7 +553,7 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
         match_ws_sorted = [name_to_ws[name] for name in pivots.keys() if name in name_to_ws]
 
         ordered = base_order + match_ws_sorted
-        sh.reorder_worksheets(ordered)
+        retry_on_transient_error(sh.reorder_worksheets, ordered)
         print("[INFO] 試合シートのみ開催日順に並び替えました(それ以外のシートは動かしていません)")
     except Exception as e:
         print(f"[WARN] シートの並び替えに失敗しました: {e}")
