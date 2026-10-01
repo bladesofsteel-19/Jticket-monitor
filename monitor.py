@@ -383,22 +383,50 @@ def extract_seat_blocks(html: str) -> list[dict]:
                     break
             block_window = lines[i:block_end]
 
-            if any(p in w for w in block_window for p in SOLD_OUT_PATTERNS):
-                status = "完売"
-            elif not any(SELECT_LINK_TEXT in w for w in block_window):
-                # 「選択する」リンクが表示されていない = 完売(実例で確認済み)
-                status = "完売"
-            else:
-                status = "販売中"
+            block_sold_out = any(p in w for w in block_window for p in SOLD_OUT_PATTERNS)
 
-            seats.append({
-                "seat_type": current_name,
-                "seat_order": current_order if current_order is not None else 9999,
-                "price_min": price_min,
-                "price_max": price_max,
-                "dynamic": is_dynamic,
-                "status": status,
-            })
+            # ブロック内の「<席種名> <区画名> [選択する]」という行を、区画ごとに個別の候補として集める
+            # (例: 「カテゴリー３・指定 南側（ホーム側）」「カテゴリー３・指定 北側． 選択する」)
+            candidates = []
+            for w in block_window:
+                if w == current_name or not w.startswith(current_name):
+                    continue
+                has_select = SELECT_LINK_TEXT in w
+                area_part = w[len(current_name):].replace(SELECT_LINK_TEXT, "").strip()
+                area_part = area_part.rstrip("．.")
+                candidates.append((area_part, has_select))
+
+            # 区画名が無い(見出しの単純な繰り返し)候補は、他に区画名ありの候補があれば除外する
+            named = [c for c in candidates if c[0]]
+            if named:
+                candidates = named
+
+            if not candidates:
+                # 区画リンクが見つからない場合は、ブロック全体で1件として扱う(従来通り)
+                status = "完売" if block_sold_out or not any(
+                    SELECT_LINK_TEXT in w for w in block_window
+                ) else "販売中"
+                seats.append({
+                    "seat_type": current_name,
+                    "seat_order": current_order if current_order is not None else 9999,
+                    "price_min": price_min,
+                    "price_max": price_max,
+                    "dynamic": is_dynamic,
+                    "status": status,
+                })
+            else:
+                for area_part, has_select in candidates:
+                    seat_type = f"{current_name} {area_part}" if area_part else current_name
+                    status = "完売" if block_sold_out or not has_select else "販売中"
+                    seats.append({
+                        "seat_type": seat_type,
+                        "seat_order": current_order if current_order is not None else 9999,
+                        "price_min": price_min,
+                        "price_max": price_max,
+                        "dynamic": is_dynamic,
+                        "status": status,
+                    })
+
             current_name = None
             current_order = None
         elif not range_m and not single_m and 2 <= len(line) <= 30 and not line.startswith("■") \
@@ -537,9 +565,10 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
         try:
             ws = retry_on_transient_error(sh.worksheet, sheet_name)
         except gspread.WorksheetNotFound:
-            ws = sh.add_worksheet(title=sheet_name, rows=200, cols=50)
+            ws = retry_on_transient_error(sh.add_worksheet, title=sheet_name, rows=200, cols=50)
         retry_on_transient_error(ws.clear)
         retry_on_transient_error(set_with_dataframe, ws, pivot.reset_index())
+        time.sleep(1.5)  # 書き込みの間隔を空けて1分あたりのクォータ超過を防ぐ
 
     print(f"[INFO] Googleスプレッドシートに書き出しました")
 
