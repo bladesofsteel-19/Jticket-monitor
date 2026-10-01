@@ -103,6 +103,7 @@ HEADERS = {
 OUTPUT_CSV = "ticket_prices.csv"
 OUTPUT_XLSX = "ticket_prices.xlsx"
 TARGETS_SHEET_NAME = "対象試合"
+CLUB_NAMES_SHEET_NAME = "チーム名"
 
 SOLD_OUT_PATTERNS = ["完売", "SOLD OUT", "販売終了"]
 RANGE_PRICE_PATTERN = re.compile(r"([\d,]+)円\s*[~〜～]\s*([\d,]+)円\s*/\s*枚")
@@ -199,13 +200,11 @@ def load_target_urls() -> list[tuple[int, str]]:
     try:
         ws = retry_on_transient_error(sh.worksheet, TARGETS_SHEET_NAME)
     except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=5)
+        ws = sh.add_worksheet(title=TARGETS_SHEET_NAME, rows=100, cols=3)
         ws.update([[
             "URL(試合ページ)",
             "対戦カード(自動入力)",
             "開催日(自動入力)",
-            "略称",
-            "クラブのフルネーム",
         ]])
         print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートが無かったので新規作成しました。URLを貼ってから再実行してください")
         return []
@@ -260,9 +259,8 @@ def update_target_row_info(row_updates: list[tuple[int, str, str]]):
 
 def load_club_abbr_map() -> dict:
     """
-    「対象試合」シートのD列(略称)・E列(クラブのフルネーム)を、行の対応関係なく
-    シート全体から読み込み、{フルネーム: 略称} の変換表として使う。
-    A列のURLとは無関係(あくまでクラブ名の変換表として全行分をまとめて読む)。
+    「チーム名」シートのA列(略称)・B列(クラブのフルネーム)を読み込み、
+    {フルネーム: 略称} の変換表として使う。シートが無ければ案内文付きで自動作成する。
     """
     try:
         gc, sh = get_gspread_client()
@@ -276,20 +274,25 @@ def load_club_abbr_map() -> dict:
     import gspread
 
     try:
-        ws = retry_on_transient_error(sh.worksheet, TARGETS_SHEET_NAME)
+        ws = retry_on_transient_error(sh.worksheet, CLUB_NAMES_SHEET_NAME)
     except gspread.WorksheetNotFound:
+        ws = retry_on_transient_error(
+            sh.add_worksheet, title=CLUB_NAMES_SHEET_NAME, rows=50, cols=2
+        )
+        retry_on_transient_error(ws.update, [["略称", "クラブのフルネーム"]])
+        print(f"[INFO] 「{CLUB_NAMES_SHEET_NAME}」シートが無かったので新規作成しました")
         return {}
 
     rows = retry_on_transient_error(ws.get_all_values)
     mapping = {}
     for row in rows:
-        abbr = row[3].strip() if len(row) > 3 else ""
-        full = row[4].strip() if len(row) > 4 else ""
-        if abbr and full:
+        abbr = row[0].strip() if len(row) > 0 else ""
+        full = row[1].strip() if len(row) > 1 else ""
+        if abbr and full and abbr != "略称":
             mapping[full] = abbr
 
     if mapping:
-        print(f"[INFO] 「{TARGETS_SHEET_NAME}」シートのB/C列から{len(mapping)}件のクラブ略称を読み込みました")
+        print(f"[INFO] 「{CLUB_NAMES_SHEET_NAME}」シートから{len(mapping)}件のクラブ略称を読み込みました")
     return mapping
 
 
