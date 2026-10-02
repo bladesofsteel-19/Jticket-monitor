@@ -111,9 +111,11 @@ SINGLE_PRICE_PATTERN = re.compile(r"基本価格[：:]\s*([\d,]+)円\s*/\s*枚")
 SELECT_LINK_TEXT = "選択する"
 
 
-def retry_on_transient_error(func, *args, max_attempts=4, base_delay=5, **kwargs):
+def retry_on_transient_error(func, *args, max_attempts=6, base_delay=5, **kwargs):
     """
     一時的なエラー(503など)が起きた場合、少し待って自動で再試行する。
+    429(1分あたりのクォータ超過)は、クォータがリセットされるまで
+    特に長めに待つ(最大60秒程度)。
     最終的にダメだった場合は、そのまま例外を投げる(呼び出し側で通常通り扱われる)。
     """
     import gspread
@@ -129,6 +131,16 @@ def retry_on_transient_error(func, *args, max_attempts=4, base_delay=5, **kwargs
                 status = e.response.status_code
             except Exception:
                 pass
+
+            if status == 429:
+                # 1分あたりのクォータ超過は、短い待ちを繰り返すより
+                # クォータがリセットされる60秒を待つ方が確実
+                wait = 60 if attempt < max_attempts else 0
+                if attempt < max_attempts:
+                    print(f"[WARN] Google Sheets APIの書き込みクォータ超過。{wait}秒待って再試行します({attempt}/{max_attempts})")
+                    time.sleep(wait)
+                    continue
+                raise
 
             if status in TRANSIENT_STATUS_CODES and attempt < max_attempts:
                 wait = base_delay * attempt
@@ -564,14 +576,18 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
         print("[INFO] Google Sheets連携は未設定のためスキップします")
         return
 
+    # 既存シート一覧を最初に1回だけ取得し、試合ごとの存在確認呼び出しを省略する
+    all_ws = retry_on_transient_error(sh.worksheets)
+    name_to_ws = {w.title: w for w in all_ws}
+
     for sheet_name, pivot in pivots.items():
-        try:
-            ws = retry_on_transient_error(sh.worksheet, sheet_name)
-        except gspread.WorksheetNotFound:
+        ws = name_to_ws.get(sheet_name)
+        if ws is None:
             ws = retry_on_transient_error(sh.add_worksheet, title=sheet_name, rows=200, cols=50)
+            name_to_ws[sheet_name] = ws
         retry_on_transient_error(ws.clear)
         retry_on_transient_error(set_with_dataframe, ws, pivot.reset_index())
-        time.sleep(1.5)  # 書き込みの間隔を空けて1分あたりのクォータ超過を防ぐ
+        time.sleep(3)  # 書き込みの間隔を空けて1分あたりのクォータ超過を防ぐ
 
     print(f"[INFO] Googleスプレッドシートに書き出しました")
 
