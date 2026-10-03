@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from monitor import get_gspread_client, retry_on_transient_error, HEADERS
+from monitor import get_gspread_client, retry_on_transient_error, HEADERS, TARGETS_SHEET_NAME
 
 JST = timezone(timedelta(hours=9))
 SALE_SHEET_NAME = "発売予定"
@@ -183,6 +183,23 @@ def export_to_sheet(rows: list[dict]):
     from gspread_dataframe import set_with_dataframe
     retry_on_transient_error(set_with_dataframe, ws, df)
     print(f"[INFO] 「{SALE_SHEET_NAME}」シートに{len(df)}件書き出しました")
+
+    # 「対象試合」シートの右隣に配置する
+    try:
+        all_ws = retry_on_transient_error(sh.worksheets)
+        others = [w for w in all_ws if w.title != SALE_SHEET_NAME]
+        names = [w.title for w in others]
+
+        if TARGETS_SHEET_NAME in names:
+            idx = names.index(TARGETS_SHEET_NAME)
+            ordered = others[: idx + 1] + [w for w in all_ws if w.title == SALE_SHEET_NAME] + others[idx + 1:]
+        else:
+            ordered = [w for w in all_ws if w.title == SALE_SHEET_NAME] + others
+
+        retry_on_transient_error(sh.reorder_worksheets, ordered)
+        print(f"[INFO] 「{SALE_SHEET_NAME}」シートを「{TARGETS_SHEET_NAME}」の右隣に配置しました")
+    except Exception as e:
+        print(f"[WARN] シートの並び替えに失敗しました: {e}")
 
 
 def main():
