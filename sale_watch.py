@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from monitor import get_gspread_client, retry_on_transient_error, HEADERS, TARGETS_SHEET_NAME
+from monitor import get_gspread_client, retry_on_transient_error, HEADERS, TARGETS_SHEET_NAME, CLUB_ABBR
 
 JST = timezone(timedelta(hours=9))
 SALE_SHEET_NAME = "発売予定"
@@ -130,6 +130,104 @@ def parse_marinos(html: str) -> list[dict]:
     return rows
 
 
+# ── 清水エスパルス ──────────────────────────────────────────
+def parse_spulse(html: str) -> list[dict]:
+    """
+    s-pulse.co.jp/tickets/schedule を解析する。
+    ブロック形式: ### 大会名・節 / M.D 曜日 時刻 K.O. 会場 / VS / 相手名 / (各種先行) / 一般販売 日付 時刻
+    発売情報がまだ無い試合は「情報掲載までお待ち下さい。」となっており、その場合はスキップする。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+
+    blocks = [b for b in re.split(r"(?:^|\n)###\s*", text) if b.strip()]
+
+    rows = []
+    for block in blocks:
+        m = re.match(
+            r"(?P<section>[^\n]+)\n+"
+            r"(?P<month>\d{1,2})\.(?P<day>\d{1,2})\s+\S+\n+"
+            r"(?:[\d:]+\s*K\.O\.\s*)?(?P<venue>[^\n]+)\n+"
+            r"VS\n+"
+            r"(?P<opponent>[^\n]+)\n+"
+            r"(?P<rest>.*)",
+            block,
+            re.S,
+        )
+        if not m:
+            continue
+
+        rest = m.group("rest")
+        general_m = re.search(
+            r"一般販売\s*\n\s*(?P<gm>\d{1,2})/(?P<gd>\d{1,2})\([^)]*\)\s*\n?\s*(?P<gt>[\d:]+)",
+            rest,
+        )
+        if not general_m:
+            continue  # 「情報掲載までお待ち下さい」等、まだ発売日未定の試合はスキップ
+
+        rows.append({
+            "club": "清水エスパルス",
+            "section": m.group("section").strip(),
+            "match_date": f"{int(m.group('month'))}/{int(m.group('day'))}",
+            "opponent": m.group("opponent").strip(),
+            "venue": m.group("venue").strip(),
+            "general_sale": f"{int(general_m.group('gm'))}/{int(general_m.group('gd'))} {general_m.group('gt')}",
+        })
+    return rows
+
+
+# 既知のクラブ名(フルネーム)一覧。相手チーム名の特定に使う
+ALL_CLUB_FULL_NAMES = sorted(set(CLUB_ABBR.keys()), key=len, reverse=True)
+
+
+def find_opponent_name(text: str) -> str | None:
+    for name in ALL_CLUB_FULL_NAMES:
+        if name in text:
+            return name
+    return None
+
+
+# ── 京都サンガF.C. ──────────────────────────────────────────
+def parse_sanga(html: str) -> list[dict]:
+    """
+    sanga-fc.jp/ticket/schedule を解析する。
+    「第N節」を区切りにブロック化し、各ブロック内の「一般販売」行から日付を取得する。
+    対戦相手はブロック先頭付近に含まれるクラブ名(既知のクラブ名リスト)で特定する。
+    販売日程がまだ無い試合(「試合開催日決定後、...」等)はスキップする。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+
+    blocks = re.split(r"第(\d+節)", text)
+    rows = []
+    # re.splitで奇数インデックスに節番号、偶数インデックスにその前後のテキストが入る
+    for i in range(1, len(blocks), 2):
+        section = blocks[i]
+        body = blocks[i + 1] if i + 1 < len(blocks) else ""
+        head = body[:200]  # 日付・対戦相手はブロック冒頭付近にあるはず
+
+        date_m = re.search(r"(\d{1,2})\.(\d{1,2})", head)
+        opponent = find_opponent_name(head)
+        general_m = re.search(
+            r"一般販売\s*\n?\s*(\d{1,2})月(\d{1,2})日[^\d〜]*〜?\s*\n?\s*([\d:]+)",
+            body,
+            re.S,
+        )
+
+        if not (date_m and opponent and general_m):
+            continue  # 対戦相手未定・販売日程未定の試合はスキップ
+
+        rows.append({
+            "club": "京都サンガF.C.",
+            "section": f"第{section}",
+            "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
+            "opponent": opponent,
+            "venue": "",
+            "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
+        })
+    return rows
+
+
 # ── 対象クラブ一覧 ──────────────────────────────────────────
 SALE_SOURCES = [
     {
@@ -141,6 +239,16 @@ SALE_SOURCES = [
         "club": "横浜F・マリノス",
         "url": "https://www.f-marinos.com/ticket/schedule",
         "parser": parse_marinos,
+    },
+    {
+        "club": "清水エスパルス",
+        "url": "https://www.s-pulse.co.jp/tickets/schedule",
+        "parser": parse_spulse,
+    },
+    {
+        "club": "京都サンガF.C.",
+        "url": "https://www.sanga-fc.jp/ticket/schedule",
+        "parser": parse_sanga,
     },
 ]
 
