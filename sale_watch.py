@@ -28,6 +28,19 @@ JST = timezone(timedelta(hours=9))
 SALE_SHEET_NAME = "発売予定"
 
 
+def text_with_img_alts(html: str) -> str:
+    """
+    HTMLをテキスト化する際、<img alt="..."> の内容もテキストとして含める。
+    クラブ名がロゴ画像だけで表示され、文字としては存在しないページ対策。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for img in soup.find_all("img"):
+        alt = img.get("alt", "").strip()
+        if alt:
+            img.replace_with(alt)
+    return soup.get_text("\n")
+
+
 def fetch(url: str) -> str | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
@@ -44,8 +57,7 @@ def parse_zelvia(html: str) -> list[dict]:
     zelvia.co.jp/stadium-ticket/schedule/ を解析する。
     ブロック形式: 【第N節】MM月DD日（曜）HH:MM〜 相手名 / スタジアム 会場名 / FC先行販売 日付 / 一般販売 日付
     """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
+    text = text_with_img_alts(html)
 
     # 「【」区切りでブロックに分割(先頭の「【」は除去されるので、以後は「【」で始まる形に戻す)
     blocks = ["【" + b for b in text.split("【")[1:]]
@@ -134,44 +146,45 @@ def parse_marinos(html: str) -> list[dict]:
 def parse_spulse(html: str) -> list[dict]:
     """
     s-pulse.co.jp/tickets/schedule を解析する。
-    ブロック形式: ### 大会名・節 / M.D 曜日 時刻 K.O. 会場 / VS / 相手名 / (各種先行) / 一般販売 日付 時刻
+    「M.D 曜日(英字3文字)」という日付表記を目印にブロックを区切る
+    (見出し記号に頼らず、実際に表示されている日付バッジのテキストを基準にする)。
     発売情報がまだ無い試合は「情報掲載までお待ち下さい。」となっており、その場合はスキップする。
     """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
+    text = text_with_img_alts(html)
 
-    blocks = [b for b in re.split(r"(?:^|\n)###\s*", text) if b.strip()]
-
+    anchors = list(re.finditer(r"(\d{1,2})\.(\d{1,2})\s+(SAT|SUN|MON|TUE|WED|THU|FRI)", text))
     rows = []
-    for block in blocks:
-        m = re.match(
-            r"(?P<section>[^\n]+)\n+"
-            r"(?P<month>\d{1,2})\.(?P<day>\d{1,2})\s+\S+\n+"
-            r"(?:[\d:]+\s*K\.O\.\s*)?(?P<venue>[^\n]+)\n+"
-            r"VS\n+"
-            r"(?P<opponent>[^\n]+)\n+"
-            r"(?P<rest>.*)",
-            block,
-            re.S,
-        )
-        if not m:
-            continue
+    for idx, am in enumerate(anchors):
+        start = am.start()
+        end = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
+        block = text[start:end]
 
-        rest = m.group("rest")
+        prev_end = anchors[idx - 1].end() if idx > 0 else 0
+        pre_text = text[prev_end:start]
+        section_m = re.search(r"第\d+節", pre_text)
+        if not section_m:
+            section_m = re.search(r"天皇杯[^\n]*", pre_text)
+        section = section_m.group(0).strip() if section_m else "大会不明"
+
+        vs_m = re.search(r"K\.O\.\s*([^\n]+)\n+VS\n+([^\n]+)", block)
+        if not vs_m:
+            continue
+        venue, opponent = vs_m.group(1).strip(), vs_m.group(2).strip()
+
         general_m = re.search(
-            r"一般販売\s*\n\s*(?P<gm>\d{1,2})/(?P<gd>\d{1,2})\([^)]*\)\s*\n?\s*(?P<gt>[\d:]+)",
-            rest,
+            r"一般販売\s*\n\s*(\d{1,2})/(\d{1,2})\([^)]*\)\s*\n?\s*([\d:]+)",
+            block,
         )
         if not general_m:
             continue  # 「情報掲載までお待ち下さい」等、まだ発売日未定の試合はスキップ
 
         rows.append({
             "club": "清水エスパルス",
-            "section": m.group("section").strip(),
-            "match_date": f"{int(m.group('month'))}/{int(m.group('day'))}",
-            "opponent": m.group("opponent").strip(),
-            "venue": m.group("venue").strip(),
-            "general_sale": f"{int(general_m.group('gm'))}/{int(general_m.group('gd'))} {general_m.group('gt')}",
+            "section": section,
+            "match_date": f"{int(am.group(1))}/{int(am.group(2))}",
+            "opponent": opponent,
+            "venue": venue,
+            "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
     return rows
 
@@ -195,8 +208,7 @@ def parse_sanga(html: str) -> list[dict]:
     対戦相手はブロック先頭付近に含まれるクラブ名(既知のクラブ名リスト)で特定する。
     販売日程がまだ無い試合(「試合開催日決定後、...」等)はスキップする。
     """
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
+    text = text_with_img_alts(html)
 
     blocks = re.split(r"第(\d+節)", text)
     rows = []
