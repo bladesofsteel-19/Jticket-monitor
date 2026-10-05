@@ -323,9 +323,14 @@ def parse_gamba(html: str) -> list[dict]:
     """
     text = text_with_img_alts(html)
 
-    blocks = text.split("HOME")[1:]
+    parts = text.split("HOME")
     rows = []
-    for block in blocks:
+    for i in range(1, len(parts)):
+        block = parts[i]
+        # 大会名・節(「明治安田J1リーグ 第12節」等)は「HOME」の直前の行に書かれている
+        prev_lines = [ln.strip() for ln in parts[i - 1].splitlines() if ln.strip()]
+        section = extract_section(prev_lines[-1]) if prev_lines else ""
+
         # 日付候補は複数ある(FC先行販売の日付も同じ形式のため)。
         # 「日付(曜)→時刻→＠スタジアム」の並びが直後に続くものだけを、本当の試合日として扱う。
         date_m = re.search(
@@ -343,7 +348,7 @@ def parse_gamba(html: str) -> list[dict]:
 
         rows.append({
             "club": "ガンバ大阪",
-            "section": "",
+            "section": section,
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
             "opponent": dedupe_name(opponent_m.group(1)),
             "venue": "",
@@ -421,7 +426,8 @@ def parse_avispa(html: str) -> list[dict]:
 
         rows.append({
             "club": "アビスパ福岡",
-            "section": "",
+            # ブロック冒頭は「会場名 → 明治安田J1リーグ 第9節 → 日付」の順
+            "section": extract_section(chunk[:200]),
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
             "opponent": opponent,
             "venue": "",
@@ -461,7 +467,7 @@ def parse_urawa(html: str) -> list[dict]:
 
         rows.append({
             "club": "浦和レッズ",
-            "section": "",
+            "section": extract_section(cells[1]),  # 「大会・節」列
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
             "opponent": dedupe_name(opponent_cell),
             "venue": "",
@@ -524,7 +530,7 @@ def collect_frontale() -> list[dict]:
         text = text_with_img_alts(html)
 
         match_m = re.search(
-            r"(\d{1,2})月(\d{1,2})日[^\n]*?第\d+節\s*(\S+?)戦",
+            r"(\d{1,2})月(\d{1,2})日[^\n]*?第(\d+)節\s*(\S+?)戦",
             text,
         )
         general_m = re.search(
@@ -539,9 +545,9 @@ def collect_frontale() -> list[dict]:
 
         rows.append({
             "club": "川崎フロンターレ",
-            "section": "",
+            "section": f"第{int(match_m.group(3))}節",
             "match_date": f"{int(match_m.group(1))}/{int(match_m.group(2))}",
-            "opponent": dedupe_name(match_m.group(3)),
+            "opponent": dedupe_name(match_m.group(4)),
             "venue": "",
             "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
@@ -554,6 +560,34 @@ def collect_frontale() -> list[dict]:
 def nfkc(s) -> str:
     """全角数字・全角括弧・全角コロン等を半角に揃える(「10：00」→「10:00」など)"""
     return unicodedata.normalize("NFKC", str(s)).strip()
+
+
+def extract_section(text: str) -> str:
+    """
+    大会名・節の表記を「C列(section)」用の短い形に揃える。
+      「明治安田J1リーグ 第12節」→「第12節」
+      「U-21 Jリーグ 交流戦ラウンド第4節」→「U-21 第4節」
+      「天皇杯 JFA 第106回全日本サッカー選手権大会 3回戦」→「天皇杯 3回戦」
+      「Jリーグ YBCルヴァンカップ 1stラウンド2回戦」→「ルヴァンカップ 2回戦」
+      「AFCチャンピオンズリーグElite MD3」→「ACLE MD3」
+    該当しなければ空文字。
+    """
+    t = nfkc(text)
+    round_m = re.search(r"(\d+回戦|準々決勝|準決勝|決勝|プレーオフ)", t)
+    rnd = f" {round_m.group(1)}" if round_m else ""
+    if "天皇杯" in t:
+        return f"天皇杯{rnd}"
+    if "ルヴァン" in t:
+        return f"ルヴァンカップ{rnd}"
+    if re.search(r"AFC|ACL", t):
+        name = "ACL2" if re.search(r"Two|ACL\s*2", t) else "ACLE"
+        md = re.search(r"MD\s*(\d+)", t)
+        return f"{name} MD{md.group(1)}" if md else f"{name}{rnd}"
+    m = re.search(r"第\s*(\d+)\s*節", t)
+    if m:
+        prefix = "U-21 " if re.search(r"U-?21", t) else ""
+        return f"{prefix}第{int(m.group(1))}節"
+    return ""
 
 
 def _flat_col(c) -> str:
@@ -689,7 +723,12 @@ def parse_grampus(html: str) -> list[dict]:
             sec = cells[i_sec] if i_sec is not None else ""
             section = comp
             if re.fullmatch(r"\d+", sec):
-                section = f"{comp} 第{sec}節".strip()
+                if comp.upper() == "J1":
+                    section = f"第{int(sec)}節"
+                elif comp.upper() == "YBC":
+                    section = f"ルヴァンカップ 第{int(sec)}節"
+                else:
+                    section = f"{comp} 第{int(sec)}節".strip()
 
             venue = cells[i_venue] if i_venue is not None else ""
             rows.append({
@@ -711,6 +750,15 @@ VERDY_TITLE_KEYWORD = "チケット販売"
 VERDY_EXCLUDE_WORDS = ("U-21", "U21", "ベレーザ", "ユース", "ジュニア")
 # 公式サイトの記載:「販売開始初日の販売開始時間は、会員割引・一般販売ともに12:00～」
 VERDY_DEFAULT_SALE_TIME = "12:00"
+# カップ戦の勝ち上がり次第でホーム開催かどうかが決まる「仮の」販売スケジュールの告知を見分ける文言。
+# 例:「ホームゲーム開催となった場合のチケット販売スケジュール」「アウェイゲーム開催となった場合、販売は実施しません」
+# 開催が確定すると、クラブは改めて販売概要の記事を出すので、そちらを拾えば足りる。
+# (「試合が中止となった場合」等の通常の注意書きに反応しないよう、開催・勝ち上がりに関する言い回しに限定している)
+VERDY_CONDITIONAL_RE = re.compile(
+    r"(ホームゲーム|ホーム|アウェイゲーム|アウェイ)開催となった場合"
+    r"|勝ち上がった場合"
+    r"|結果をもとに、?改めてお知らせ"
+)
 
 
 def parse_verdy_article(html: str) -> list[dict]:
@@ -754,6 +802,32 @@ def parse_verdy_article(html: str) -> list[dict]:
     return rows
 
 
+# 販売記事の表に「節」列が無い場合の補完用。Football LAB(データスタジアム運営)の日程表を使う。
+# year はシーズン開始年(2026/27シーズン → 2026)
+VERDY_FIXTURE_URL = "https://www.football-lab.jp/tk-v/match?year={year}"
+
+
+def fetch_verdy_section_lookup() -> dict[str, str]:
+    """J1の日程表から {"11/21": "第15節", ...} の対応表を作る。取得できなければ空の辞書"""
+    today = datetime.now(JST).date()
+    season_year = today.year if today.month >= 7 else today.year - 1
+    html = fetch(VERDY_FIXTURE_URL.format(year=season_year))
+    if not html:
+        return {}
+
+    # pd.read_html だと「10.10」が数値の10.1になってしまうため、セルを文字列のまま読む
+    soup = BeautifulSoup(html, "html.parser")
+    lookup = {}
+    for tr in soup.find_all("tr"):
+        cells = [nfkc(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+        if len(cells) < 2 or not re.fullmatch(r"\d+", cells[0]):
+            continue
+        dm = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", cells[1])
+        if dm:
+            lookup[f"{int(dm.group(1))}/{int(dm.group(2))}"] = f"第{int(cells[0])}節"
+    return lookup
+
+
 def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
     """
     verdy.co.jp は販売日程ページの表がJSで後から読み込まれるため、
@@ -792,6 +866,11 @@ def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
         html = fetch(url)
         if not html:
             continue
+        if VERDY_CONDITIONAL_RE.search(nfkc(text_with_img_alts(html))):
+            print(f"[INFO] 東京ヴェルディ: {url} は勝ち上がり次第の仮スケジュールのためスキップします")
+            time.sleep(1)
+            continue
+
         try:
             article_rows = parse_verdy_article(html)
         except Exception as e:
@@ -812,6 +891,15 @@ def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
             seen.add(key)
             rows.append(row)
         time.sleep(1)
+
+    # 記事の表に「節」列が無かった試合は、日程表から節を補う(J1以外の試合は日付が一致しないので空のまま)
+    if any(not r["section"] for r in rows):
+        lookup = fetch_verdy_section_lookup()
+        if DEBUG_TEXT_DUMP:
+            print(f"[DEBUG] 東京ヴェルディ: 節の対応表 {len(lookup)}件")
+        for r in rows:
+            if not r["section"]:
+                r["section"] = lookup.get(r["match_date"], "")
 
     return rows
 
