@@ -17,6 +17,7 @@ Google Sheetsまわりの接続処理は monitor.py のものをそのまま再�
 import io
 import os
 import re
+import time
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -40,6 +41,21 @@ def text_with_img_alts(html: str) -> str:
         if alt:
             img.replace_with(alt)
     return soup.get_text("\n")
+
+
+def dedupe_name(s: str) -> str:
+    """
+    ロゴ画像のalt属性と、直後のテキストでチーム名が重複しているケースを1つにまとめる。
+    例: 「浦和レッズ浦和レッズ」「浦和レッズ 浦和レッズ」→「浦和レッズ」
+    """
+    s = s.strip()
+    n = len(s)
+    if n % 2 == 0 and n > 0 and s[: n // 2] == s[n // 2:]:
+        return s[: n // 2]
+    parts = s.split()
+    if len(parts) == 2 and parts[0] == parts[1]:
+        return parts[0]
+    return s
 
 
 def fetch(url: str) -> str | None:
@@ -69,8 +85,8 @@ def parse_zelvia(html: str) -> list[dict]:
             r"【(?P<section>[^】]+)】\s*"
             r"(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
             r"（[^）]+）\s*(?P<time>[\d:]+|未定)\s*〜\s*"
-            r"(?P<opponent>\S+?)\s*\n"
-            r"スタジアム\s*\n?\s*(?P<venue>\S+)\s*\n"
+            r"(?P<opponent>[^\n]+?)\s*\n"
+            r".*?スタジアム\s*\n?\s*(?P<venue>\S+)\s*\n"
             r".*?"
             r"一般販売\s*\n\s*(?P<general>[^\n〜]+)\s*〜",
             block,
@@ -82,7 +98,7 @@ def parse_zelvia(html: str) -> list[dict]:
             "club": "FC町田ゼルビア",
             "section": m.group("section").strip(),
             "match_date": f"{int(m.group('month'))}/{int(m.group('day'))}",
-            "opponent": m.group("opponent").strip(),
+            "opponent": dedupe_name(m.group("opponent")),
             "venue": m.group("venue").strip(),
             "general_sale": m.group("general").strip(),
         })
@@ -221,11 +237,14 @@ def parse_sanga(html: str) -> list[dict]:
 
         date_m = re.search(r"(\d{1,2})\.(\d{1,2})", head)
         opponent = find_opponent_name(head)
-        general_m = re.search(
-            r"一般販売\s*\n?\s*(\d{1,2})月(\d{1,2})日[^\d〜]*〜?\s*\n?\s*([\d:]+)",
-            body,
-            re.S,
-        )
+
+        # 「一般販売」の直後、多少余計な文字(罫線・「販売中」等)が挟まっても
+        # 最初に現れる日付+時刻パターンを拾う
+        general_m = None
+        gm_idx = body.rfind("一般販売")
+        if gm_idx != -1:
+            window = body[gm_idx: gm_idx + 150]
+            general_m = re.search(r"(\d{1,2})月(\d{1,2})日[^\d]*?(\d{1,2}:\d{2})", window)
 
         if not (date_m and opponent and general_m):
             continue  # 対戦相手未定・販売日程未定の試合はスキップ
@@ -247,21 +266,25 @@ SALE_SOURCES = [
         "club": "FC町田ゼルビア",
         "url": "https://www.zelvia.co.jp/stadium-ticket/schedule/",
         "parser": parse_zelvia,
+        "expect_marker": "一般販売",
     },
     {
         "club": "横浜F・マリノス",
         "url": "https://www.f-marinos.com/ticket/schedule",
         "parser": parse_marinos,
+        "expect_marker": "一般販売",
     },
     {
         "club": "清水エスパルス",
         "url": "https://www.s-pulse.co.jp/tickets/schedule",
         "parser": parse_spulse,
+        "expect_marker": "一般販売",
     },
     {
         "club": "京都サンガF.C.",
         "url": "https://www.sanga-fc.jp/ticket/schedule",
         "parser": parse_sanga,
+        "expect_marker": "一般販売",
     },
 ]
 
@@ -269,11 +292,37 @@ SALE_SOURCES = [
 DEBUG_TEXT_DUMP = os.environ.get("SALE_WATCH_DEBUG") == "1"
 
 
+def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8) -> str | None:
+    """
+    取得したHTMLに、本来あるはずの目印文字列(expect_marker)が含まれているか確認する。
+    無ければ、ボット対策等で内容が間引かれて返された可能性があるとみなし、
+    少し待って再取得する。
+    """
+    marker = source.get("expect_marker")
+    for attempt in range(1, max_attempts + 1):
+        html = fetch(source["url"])
+        if not html:
+            if attempt < max_attempts:
+                time.sleep(delay)
+                continue
+            return None
+
+        if not marker or marker in html:
+            return html
+
+        print(f"[WARN] {source['club']}: 目印「{marker}」が見つかりません(内容が間引かれた可能性)。"
+              f"{delay}秒待って再取得します({attempt}/{max_attempts})")
+        if attempt < max_attempts:
+            time.sleep(delay)
+
+    return html  # 最終的に目印が無くても、最後に取得できた内容をそのまま返す(呼び出し側で0件になるだけ)
+
+
 def collect_all() -> list[dict]:
     all_rows = []
     for source in SALE_SOURCES:
         print(f"[INFO] checking {source['club']} ({source['url']})")
-        html = fetch(source["url"])
+        html = fetch_with_marker_retry(source)
         if not html:
             continue
 
