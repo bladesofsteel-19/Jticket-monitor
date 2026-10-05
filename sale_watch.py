@@ -434,24 +434,36 @@ def collect_frontale() -> list[dict]:
         "https://www.frontale.co.jp/info/ticket/",
     ]
     list_html = None
+    used_seed = None
     for seed in seed_urls:
         list_html = fetch(seed)
         if list_html:
+            used_seed = seed
             break
     if not list_html:
         print("[WARN] 川崎フロンターレ: ニュース一覧の取得に失敗しました")
         return []
 
+    if DEBUG_TEXT_DUMP:
+        print(f"[DEBUG] 川崎フロンターレ: 一覧ページ取得成功 ({used_seed})")
+
     soup = BeautifulSoup(list_html, "html.parser")
     links = []
+    all_titles_sample = []
     for a in soup.find_all("a", href=True):
         title = a.get_text(strip=True)
+        if title and len(all_titles_sample) < 20:
+            all_titles_sample.append(title)
         if TICKET_TITLE_RE.match(title):
             href = a["href"]
             full_url = href if href.startswith("http") else f"https://www.frontale.co.jp{href}"
             if full_url not in links:
                 links.append(full_url)
     links = links[:10]  # 直近いくつかだけ
+
+    if DEBUG_TEXT_DUMP:
+        print(f"[DEBUG] 川崎フロンターレ: リンク候補{len(links)}件見つかりました: {links}")
+        print(f"[DEBUG] 川崎フロンターレ: ページ内のリンクテキスト例(先頭20件): {all_titles_sample}")
 
     rows = []
     for url in links:
@@ -469,6 +481,9 @@ def collect_frontale() -> list[dict]:
             text,
         )
         if not (match_m and general_m):
+            if DEBUG_TEXT_DUMP:
+                print(f"[DEBUG] 川崎フロンターレ: {url} の解析に失敗(match_m={bool(match_m)}, general_m={bool(general_m)})")
+                print(repr(text[:1500]))
             continue
 
         rows.append({
