@@ -387,6 +387,10 @@ def parse_gamba(html: str) -> list[dict]:
         if not (date_m and opponent_m):
             continue
 
+        # U-21(セカンドチーム)の試合は対象外。見出し(「U-21 Jリーグ …」)か相手名(「U-21 清水エスパルス」)で判定
+        if section.startswith("U-21") or re.search(r"U-?21", nfkc(opponent_m.group(1))):
+            continue
+
         general_m = re.search(r"一般販売\s*\n\s*([^\n未]+)", block)
         if not general_m:
             continue  # 「未定」等、まだ発売日未定の試合はスキップ
@@ -1139,7 +1143,7 @@ def fill_missing_from_footballlab(rows: list[dict]) -> None:
                 print(f"[DEBUG] {r['club']}: Football LAB の日程 {len(cache[code])}件")
         info = cache[code].get(r["match_date"])
         if not info:
-            continue  # カップ戦など、J1日程に無い試合
+            continue  # カップ戦・ACLなど、J1日程に無い試合は空欄のまま
         if not r.get("section"):
             r["section"] = info["section"]
         if not r.get("venue"):
