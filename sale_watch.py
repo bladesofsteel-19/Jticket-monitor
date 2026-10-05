@@ -1238,8 +1238,28 @@ def fill_missing_from_footballlab(rows: list[dict]) -> None:
 
 
 def normalize_venues(rows: list[dict]) -> None:
+    """
+    会場名を正式名称に揃える。メインのスプレッドシートの「スタジアム略称」シート(表記→正式名称)を優先し、
+    シートが無い・見つからない会場は、コード内の VENUE_FULL_NAMES で変換する。
+    """
+    table = {}
+    resolve = None
+    try:
+        from price_history import load_venue_table, resolve_venue
+        gc, sh = get_gspread_client()
+        if sh is not None:
+            table = load_venue_table(sh)
+            resolve = resolve_venue
+    except Exception as e:
+        print(f"[WARN] 「スタジアム略称」シートの読み込みに失敗したため、コード内の変換表を使います ({e})")
+
     for r in rows:
         v = nfkc(r.get("venue", "")) if r.get("venue") else ""
+        if v and table and resolve:
+            hit = resolve(v, table)
+            if hit and hit[1]:
+                r["venue"] = hit[1]
+                continue
         r["venue"] = VENUE_FULL_NAMES.get(v, v)
 
 
@@ -1338,8 +1358,112 @@ def export_to_sheet(rows: list[dict]):
         print(f"[WARN] シートの並び替えに失敗しました: {e}")
 
 
+# ── チケットサイトの試合ページURLの自動取得 ─────────────────────────
+# jleague-ticket.jp のクラブ別ページ(/club/{code}/)には、そのクラブの試合ページへのリンクが並んでいる。
+# 発売予定の各試合について、試合日が一致するリンクを探し、試合ページのタイトルで
+# 「ホームクラブ・試合日」を確かめてから採用する(アウェイ側の試合や別日の試合を取り違えないため)。
+JLT_BASE = "https://www.jleague-ticket.jp"
+PERFORM_LINK_RE = re.compile(r"/sales/perform/(\d+)/(\d+)")
+
+
+def _key(s) -> str:
+    return re.sub(r"\s+", "", nfkc(s))
+
+
+def club_code_for(club: str) -> str | None:
+    from monitor import J1_CLUBS
+    for code, full in J1_CLUBS.items():
+        if _key(full) == _key(club):
+            return code
+    return None
+
+
+def collect_club_page_links(code: str) -> dict[str, set[str]]:
+    """{試合ページURL: {リンク文字列に含まれる 'M/D', ...}} を返す"""
+    html = fetch(f"{JLT_BASE}/club/{code}/")
+    if not html:
+        return {}
+    soup = BeautifulSoup(html, "html.parser")
+    links: dict[str, set[str]] = {}
+    for a in soup.find_all("a", href=True):
+        m = PERFORM_LINK_RE.search(a["href"])
+        if not m:
+            continue
+        url = f"{JLT_BASE}/sales/perform/{m.group(1)}/{m.group(2)}"
+        text = nfkc(a.get_text(" ", strip=True))
+        dm = re.search(r"(\d{1,2})/(\d{1,2})", text)
+        if dm:
+            links.setdefault(url, set()).add(f"{int(dm.group(1))}/{int(dm.group(2))}")
+    return links
+
+
+def link_ticket_urls(rows: list[dict], clubs: set[str] | None = None) -> None:
+    """
+    発売予定の各行に、チケットサイトの試合ページURL(ticket_url)を付ける。
+    clubs を渡した場合は、そのクラブ(照合キー)だけを対象にする(価格履歴を記録するクラブに絞るため)。
+    """
+    from monitor import extract_match_meta
+
+    for r in rows:
+        r.setdefault("ticket_url", "")
+
+    by_club: dict[str, list[dict]] = {}
+    for r in rows:
+        by_club.setdefault(r["club"], []).append(r)
+
+    for club, club_rows in by_club.items():
+        if clubs is not None and _key(club) not in clubs:
+            continue
+        code = club_code_for(club)
+        if not code:
+            continue
+        links = collect_club_page_links(code)
+        need = {r["match_date"]: r for r in club_rows}
+        found = 0
+        for url, mds in links.items():
+            if not any(md in need and not need[md]["ticket_url"] for md in mds):
+                continue
+            page = fetch(url)
+            time.sleep(1)
+            if not page:
+                continue
+            meta = extract_match_meta(page, url)
+            home = nfkc(meta.get("raw_card", "")).split("対")[0].strip()
+            dm = re.search(r"\d{4}/(\d{1,2})/(\d{1,2})", meta.get("match_date", ""))
+            if not dm or _key(home) != _key(club):
+                continue  # アウェイ側の試合など
+            md = f"{int(dm.group(1))}/{int(dm.group(2))}"
+            if md in need and not need[md]["ticket_url"]:
+                need[md]["ticket_url"] = url
+                found += 1
+        print(f"[INFO] {club}: チケットサイトの試合ページを{found}件見つけました(リンク候補{len(links)}件)")
+        time.sleep(2)
+
+
+def history_clubs() -> set[str] | None:
+    """「履歴ファイル」シートに登録されているクラブ(照合キー)。読めなければ None(=全クラブ対象)"""
+    try:
+        from price_history import load_history_files
+        gc, sh = get_gspread_client()
+        if sh is None:
+            return None
+        files = load_history_files(sh)
+        return {club for (_season, club) in files} or None
+    except Exception as e:
+        print(f"[WARN] 「履歴ファイル」シートを読めませんでした ({e})")
+        return None
+
+
 def main():
     rows = collect_all()
+    try:
+        link_ticket_urls(rows, history_clubs())
+    except Exception as e:
+        print(f"[WARN] 試合ページURLの取得に失敗しました ({type(e).__name__}: {e})")
+        for r in rows:
+            r.setdefault("ticket_url", "")
+    # 見つけた試合ページURLは「発売予定」シートの ticket_url 列に書くだけで、「対象試合」シートには入れない。
+    # 価格の取得とクラブ別ファイルへの記録は、monitor.py(price_history.py)がこの列を読んで行う。
     export_to_sheet(rows)
 
 
