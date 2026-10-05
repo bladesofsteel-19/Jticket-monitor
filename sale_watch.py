@@ -68,6 +68,34 @@ def fetch(url: str) -> str | None:
         return None
 
 
+def fetch_with_playwright(url: str) -> str | None:
+    """
+    通常のrequestsではボット対策で中身が間引かれてしまうサイト用に、
+    実際のブラウザ(Chromium)を起動してページを取得する。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[WARN] playwrightが未インストールのためスキップします")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                user_agent=HEADERS.get("User-Agent"),
+                locale="ja-JP",
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            content = page.content()
+            browser.close()
+            return content
+    except Exception as e:
+        print(f"[WARN] playwrightでの取得に失敗しました: {url} ({e})")
+        return None
+
+
 # ── FC町田ゼルビア ──────────────────────────────────────────
 def parse_zelvia(html: str) -> list[dict]:
     """
@@ -279,12 +307,14 @@ SALE_SOURCES = [
         "url": "https://www.s-pulse.co.jp/tickets/schedule",
         "parser": parse_spulse,
         "expect_marker": "一般販売",
+        "use_playwright": True,  # requestsだと内容が間引かれて返ってくるため
     },
     {
         "club": "京都サンガF.C.",
         "url": "https://www.sanga-fc.jp/ticket/schedule",
         "parser": parse_sanga,
         "expect_marker": "一般販売",
+        "use_playwright": True,  # requestsだと内容が間引かれて返ってくるため
     },
 ]
 
@@ -299,8 +329,9 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
     少し待って再取得する。
     """
     marker = source.get("expect_marker")
+    use_pw = source.get("use_playwright", False)
     for attempt in range(1, max_attempts + 1):
-        html = fetch(source["url"])
+        html = fetch_with_playwright(source["url"]) if use_pw else fetch(source["url"])
         if not html:
             if attempt < max_attempts:
                 time.sleep(delay)
