@@ -521,7 +521,7 @@ def collect_frontale() -> list[dict]:
 
         match_m = re.search(
             r"(\d{1,2})月(\d{1,2})日[^\n]*?第\d+節\s*(\S+?)戦",
-            text[:2000],
+            text,
         )
         general_m = re.search(
             r"一般[：:]\s*(\d{1,2})月(\d{1,2})日[^\d]*?(\d{1,2}:\d{2})",
