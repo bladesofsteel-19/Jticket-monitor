@@ -68,6 +68,34 @@ def fetch(url: str) -> str | None:
         return None
 
 
+def fetch_with_playwright(url: str) -> str | None:
+    """
+    JavaScriptで後から内容が表示されるページ用に、実際のブラウザ(Chromium)で取得する。
+    川崎フロンターレ(frontale.co.jp)専用。
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("[WARN] playwrightが未インストールのためスキップします")
+        return None
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch()
+            context = browser.new_context(
+                user_agent=HEADERS.get("User-Agent"),
+                locale="ja-JP",
+            )
+            page = context.new_page()
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            content = page.content()
+            browser.close()
+            return content
+    except Exception as e:
+        print(f"[WARN] playwrightでの取得に失敗しました: {url} ({e})")
+        return None
+
+
 
 
 
@@ -436,7 +464,7 @@ def collect_frontale() -> list[dict]:
     list_html = None
     used_seed = None
     for seed in seed_urls:
-        list_html = fetch(seed)
+        list_html = fetch_with_playwright(seed)
         if list_html:
             used_seed = seed
             break
@@ -467,7 +495,7 @@ def collect_frontale() -> list[dict]:
 
     rows = []
     for url in links:
-        html = fetch(url)
+        html = fetch_with_playwright(url)
         if not html:
             continue
         text = text_with_img_alts(html)
