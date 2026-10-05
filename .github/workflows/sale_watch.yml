@@ -1,7 +1,12 @@
 name: Ticket sale date watch
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: "デバッグモード(実際のテキストをログに出力する)"
+        type: boolean
+        default: false
   schedule:
     # 毎週月曜 9:00 JST = 0:00 UTC(発売日情報は毎日変わるものではないため週1回で十分)
     - cron: "0 0 * * 1"
@@ -35,3 +40,4 @@ jobs:
         run: python sale_watch.py
         env:
           GOOGLE_CREDENTIALS_PATH: service_account.json
+          SALE_WATCH_DEBUG: ${{ inputs.debug && '1' || '0' }}
