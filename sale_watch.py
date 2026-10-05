@@ -88,6 +88,17 @@ def fetch_with_playwright(url: str) -> str | None:
             )
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=30000)
+
+            # 「チケット」カテゴリーのリンク/ボタンがあれば、実際にクリックして
+            # 一覧を絞り込む(URL直接アクセスだけでは反映されないサイト対策)
+            try:
+                category_link = page.get_by_text("チケット", exact=True).first
+                if category_link.count() > 0:
+                    category_link.click(timeout=5000)
+                    page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
             # 遅延読み込み(スクロールで初めて表示される)対策として、
             # 下までスクロールしてから少し待つ
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -462,8 +473,8 @@ def collect_frontale() -> list[dict]:
     「M/D 相手「チケット販売」のお知らせ」という記事を見つけて個別に読む。
     """
     seed_urls = [
-        "https://www.frontale.co.jp/info/index.html",
         "https://www.frontale.co.jp/info/ticket/",
+        "https://www.frontale.co.jp/info/index.html",
     ]
     list_html = None
     used_seed = None
