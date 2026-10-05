@@ -746,6 +746,32 @@ def collect_auto_rows(sh) -> list[dict]:
     return rows
 
 
+def clear_past_ticket_urls(sh, today: date) -> None:
+    """
+    「発売予定」シートで、試合日を過ぎた(=試合日の翌日以降の)試合の ticket_url を空欄にする。
+    sale_watch.py の次の実行(週1回)でシートは作り直されるが、それまでの間も古いURLを残さないため。
+    """
+    import gspread
+    try:
+        ws = retry_on_transient_error(sh.worksheet, SALE_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        return
+    values = retry_on_transient_error(ws.get_all_values)
+    if not values or "ticket_url" not in values[0] or "match_date" not in values[0]:
+        return
+    col_url = values[0].index("ticket_url")
+    col_date = values[0].index("match_date")
+    cells = []
+    for i, row in enumerate(values[1:], start=2):
+        url = row[col_url].strip() if col_url < len(row) else ""
+        md = row[col_date] if col_date < len(row) else ""
+        if url and infer_upcoming_date(md, today) is None:
+            cells.append(gspread.Cell(row=i, col=col_url + 1, value=""))
+    if cells:
+        retry_on_transient_error(ws.update_cells, cells)
+        print(f"[INFO] 「{SALE_SHEET_NAME}」シート: 試合日を過ぎた{len(cells)}試合のURLを消しました")
+
+
 def main():
     from monitor import load_club_abbr_map
 
@@ -753,6 +779,10 @@ def main():
     if gc is None or sh is None:
         print("[INFO] Google Sheets未設定のため価格履歴の記録をスキップします")
         return
+    try:
+        clear_past_ticket_urls(sh, datetime.now(JST).date())
+    except Exception as e:
+        print(f"[WARN] 発売予定シートの古いURLの削除に失敗しました ({e})")
     rows = collect_auto_rows(sh)
     abbr_map = load_club_abbr_map()  # 相手チームの略称(「チーム名」シート)
     record_price_history(rows, abbr_map)
