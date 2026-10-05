@@ -62,11 +62,29 @@ def dedupe_name(s: str) -> str:
     return s
 
 
+def decode_response(resp: requests.Response) -> str:
+    """
+    レスポンス本文を正しい文字コードで文字列にする。
+    サーバーが Content-Type に charset を付けていない場合(例: 名古屋の発売予定ページは
+    「text/html;」だけ)、requests は規格上の既定値 ISO-8859-1 で解釈してしまい、
+    日本語が「ç\x99ºå£²...」のように文字化けする。その場合は UTF-8 を優先して試し、
+    だめなら本文から推定した文字コード(Shift_JIS等)で読む。
+    """
+    content_type = resp.headers.get("Content-Type", "").lower()
+    if "charset=" in content_type:
+        return resp.text
+    try:
+        return resp.content.decode("utf-8")
+    except UnicodeDecodeError:
+        resp.encoding = resp.apparent_encoding or "utf-8"
+        return resp.text
+
+
 def fetch(url: str) -> str | None:
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
-        return resp.text
+        return decode_response(resp)
     except requests.RequestException as e:
         print(f"[WARN] fetch failed: {url} ({e})")
         return None
