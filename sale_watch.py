@@ -15,6 +15,7 @@ Google Sheetsまわりの接続処理は monitor.py のものをそのまま再�
 """
 
 import io
+import os
 import re
 from datetime import datetime, timezone, timedelta
 
@@ -265,6 +266,9 @@ SALE_SOURCES = [
 ]
 
 
+DEBUG_TEXT_DUMP = os.environ.get("SALE_WATCH_DEBUG") == "1"
+
+
 def collect_all() -> list[dict]:
     all_rows = []
     for source in SALE_SOURCES:
@@ -272,6 +276,13 @@ def collect_all() -> list[dict]:
         html = fetch(source["url"])
         if not html:
             continue
+
+        if DEBUG_TEXT_DUMP:
+            sample = text_with_img_alts(html)[:1500]
+            print(f"[DEBUG] ---- {source['club']} の実際のテキスト(先頭1500文字) ----")
+            print(repr(sample))
+            print("[DEBUG] ---- ここまで ----")
+
         rows = source["parser"](html)
         print(f"[INFO] {source['club']}: {len(rows)}件取得")
         all_rows.extend(rows)
