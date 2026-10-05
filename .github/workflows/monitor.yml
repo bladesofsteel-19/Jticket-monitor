@@ -28,8 +28,17 @@ jobs:
         if: ${{ env.GOOGLE_SERVICE_ACCOUNT_JSON != '' }}
         run: echo "$GOOGLE_SERVICE_ACCOUNT_JSON" > service_account.json
 
+      # ① 手動: 対象試合シートの試合 → メインのスプレッドシート
       - name: Run price check
         run: python monitor.py
+        env:
+          GOOGLE_CREDENTIALS_PATH: service_account.json
+
+      # ② 自動: 発売予定シートの ticket_url の試合 → クラブ別ファイル
+      #    失敗しても①の結果のコミットは止めない
+      - name: Record price history (club files)
+        run: python price_history.py
+        continue-on-error: true
         env:
           GOOGLE_CREDENTIALS_PATH: service_account.json
 
