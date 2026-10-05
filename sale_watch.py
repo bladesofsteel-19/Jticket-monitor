@@ -538,34 +538,41 @@ def parse_vissel(html: str) -> list[dict]:
     1試合ごとの並び(NFKC・空白整理後):
         明治安田J1リーグ        ← 大会ロゴのalt(ACLは「ACL Elite」)
         第12節                  ← ACLは「MD2」
-        10/24 (土)
+        10/24 (土)              ← 試合日(次の行がキックオフ時刻)。これを区切りにする
         15:00
         町田 町田               ← エンブレムのalt + クラブ名(略称)
         ノエスタ                ← スタジアム
         ロイヤル: 販売中 ... 一般: 販売中   または   一般: 10/14(水)
-        試合情報 >              ← 各試合の末尾。これを区切りにする
     一般販売の欄には日付しか無いので、時刻は公式サイト記載の10:00を補う。
     すでに発売済みの試合は日付が消えて「販売中」になるため、その場合は「販売中」と出力する。
     """
     text = nfkc(text_with_img_alts(html))
+    # このサイトは改行が「\r\n」で、インデントの空白も非常に多いので、改行と空白を揃えてから扱う
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r" *\n[\s]*", "\n", text)
+    text = re.sub(r" *\n\s*", "\n", text)
+
+    # 試合日 = 「日付(曜)」の次の行がキックオフ時刻のもの(販売日の「10/10(土)」と区別するため)
+    anchors = list(re.finditer(
+        r"(\d{1,2})/(\d{1,2})\s*\([^)]*\)\s*\n(?:\d{1,2}:\d{2}|未定|-+)", text))
+    if not anchors and DEBUG_TEXT_DUMP:
+        idx = text.find("対戦相手")
+        print("[DEBUG] ヴィッセル神戸: 試合日が見つかりません。整形後のテキスト:")
+        print(repr(text[max(0, idx):max(0, idx) + 1500]))
 
     rows = []
-    for block in re.split(r"試合情報\s*>", text)[:-1]:
-        # 試合日 = 「日付(曜)」の次の行がキックオフ時刻のもの(販売日の「10/10(土)」と区別するため)
-        dms = list(re.finditer(
-            r"(\d{1,2})/(\d{1,2})\s*\([^)]*\)\s*\n\s*(?:\d{1,2}:\d{2}|未定|-+)", block))
-        if not dms:
-            continue
-        dm = dms[-1]
+    for i, am in enumerate(anchors):
+        prev_end = anchors[i - 1].end() if i > 0 else 0
+        next_start = anchors[i + 1].start() if i + 1 < len(anchors) else len(text)
 
-        pre_lines = [ln.strip() for ln in block[:dm.start()].splitlines() if ln.strip()]
+        # 大会名・節は試合日の直前の2行
+        pre_lines = [ln.strip() for ln in text[prev_end:am.start()].splitlines() if ln.strip()]
         section = extract_section(" ".join(pre_lines[-2:])) if pre_lines else ""
 
-        # 日付・キックオフの後ろ: 相手名(エンブレムのaltと重複することがある) → スタジアム → 販売日程
+        after = text[am.end():next_start]
+        # 試合日・キックオフの後ろ: 相手名(エンブレムのaltと重複することがある) → スタジアム → 販売日程
         after_lines = []
-        for ln in block[dm.end():].splitlines():
+        for ln in after.splitlines():
             ln = ln.strip()
             if ln and (not after_lines or after_lines[-1] != ln):
                 after_lines.append(ln)
@@ -574,7 +581,7 @@ def parse_vissel(html: str) -> list[dict]:
         opponent = normalize_opponent(dedupe_name(after_lines[0]))
         venue = after_lines[1]
 
-        general_m = re.search(r"一般\s*[:：]\s*([^\n]+)", block[dm.end():])
+        general_m = re.search(r"一般\s*[:：]\s*([^\n]+)", after)
         if not general_m:
             continue
         general_raw = general_m.group(1).strip()
@@ -589,7 +596,7 @@ def parse_vissel(html: str) -> list[dict]:
         rows.append({
             "club": "ヴィッセル神戸",
             "section": section,
-            "match_date": f"{int(dm.group(1))}/{int(dm.group(2))}",
+            "match_date": f"{int(am.group(1))}/{int(am.group(2))}",
             "opponent": opponent,
             "venue": venue,
             "general_sale": general,
@@ -1086,7 +1093,8 @@ SALE_SOURCES = [
         "club": "ヴィッセル神戸",
         "url": "https://www.vissel-kobe.co.jp/ticket/schedule/",
         "parser": parse_vissel,
-        "expect_marker": "チケット販売スケジュール",
+        # 「チケット販売スケジュール」はメニューにもあり、DEBUG出力がメニュー部分になってしまうため、表の見出しを目印にする
+        "expect_marker": "対戦相手",
     },
     # (旧メモ)清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
