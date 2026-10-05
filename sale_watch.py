@@ -11,7 +11,7 @@ Google Sheetsまわりの接続処理は monitor.py のものをそのまま再�
 - 1ページ解析方式(parser): FC町田ゼルビア / 横浜F・マリノス / ガンバ大阪 / セレッソ大阪 /
   アビスパ福岡 / 浦和レッズ / 名古屋グランパス
 - 記事巡回方式(collector): 川崎フロンターレ(Playwright必須) / 東京ヴェルディ(requestsのみ)
-- 対象外(ボット対策で取得不可、パーサーは残置): 清水エスパルス / 京都サンガF.C.
+- 1ページ解析方式(GAS経由の取得にも対応): 清水エスパルス / 京都サンガF.C.
 
 他のクラブは、それぞれ公式サイトの形式を個別に確認しながら追加していく。
 """
@@ -86,7 +86,8 @@ def fetch(url: str) -> str | None:
         resp.raise_for_status()
         return decode_response(resp)
     except requests.RequestException as e:
-        print(f"[WARN] fetch failed: {url} ({e})")
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        print(f"[WARN] fetch failed: {url} (status={status}, {type(e).__name__}: {e})")
         return None
 
 
@@ -235,33 +236,38 @@ def parse_marinos(html: str) -> list[dict]:
 def parse_spulse(html: str) -> list[dict]:
     """
     s-pulse.co.jp/tickets/schedule を解析する。
-    「M.D 曜日(英字3文字)」という日付表記を目印にブロックを区切る
-    (見出し記号に頼らず、実際に表示されている日付バッジのテキストを基準にする)。
+    1試合ごとに次の並びで書かれている(全角英数字はNFKCで半角にしてから扱う):
+        ロゴ:明治安田J1リーグ 第2節      ← 見出し(大会名・節)
+        8.15 SAT                         ← 日付バッジ(これを区切りにする)
+        18:30 K.O. IAIスタジアム日本平
+        VS
+        ロゴ:横浜F・マリノス              ← エンブレム画像のalt
+        横浜F・マリノス
+        ... 一般販売 / 7/30(木) / 10:00
     発売情報がまだ無い試合は「情報掲載までお待ち下さい。」となっており、その場合はスキップする。
     """
-    text = text_with_img_alts(html)
+    text = nfkc(text_with_img_alts(html))
 
     anchors = list(re.finditer(r"(\d{1,2})\.(\d{1,2})\s+(SAT|SUN|MON|TUE|WED|THU|FRI)", text))
     rows = []
     for idx, am in enumerate(anchors):
-        start = am.start()
-        end = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
-        block = text[start:end]
+        end_pos = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
+        block = text[am.end():end_pos]
 
+        # 見出し(大会名・節)は日付バッジの直前の行
         prev_end = anchors[idx - 1].end() if idx > 0 else 0
-        pre_text = text[prev_end:start]
-        section_m = re.search(r"第\d+節", pre_text)
-        if not section_m:
-            section_m = re.search(r"天皇杯[^\n]*", pre_text)
-        section = section_m.group(0).strip() if section_m else "大会不明"
+        pre_lines = [ln.strip() for ln in text[prev_end:am.start()].splitlines() if ln.strip()]
+        section = extract_section(" ".join(pre_lines[-2:])) if pre_lines else ""
 
-        vs_m = re.search(r"K\.O\.\s*([^\n]+)\n+VS\n+([^\n]+)", block)
+        # 「K.O. 会場名 ... VS ... 相手名」。VSの後はエンブレムのalt(「ロゴ:相手名」)と相手名が続く
+        vs_m = re.search(r"K\.O\.\s*([^\n]*)\n\s*VS\s*\n\s*([^\n]+)", block)
         if not vs_m:
             continue
-        venue, opponent = vs_m.group(1).strip(), vs_m.group(2).strip()
+        venue = vs_m.group(1).strip()
+        opponent = re.sub(r"^ロゴ\s*[:：]\s*", "", vs_m.group(2).strip())
 
         general_m = re.search(
-            r"一般販売\s*\n\s*(\d{1,2})/(\d{1,2})\([^)]*\)\s*\n?\s*([\d:]+)",
+            r"一般販売\s*(\d{1,2})/(\d{1,2})\s*\([^)]*\)\s*(\d{1,2}:\d{2})",
             block,
         )
         if not general_m:
@@ -271,7 +277,7 @@ def parse_spulse(html: str) -> list[dict]:
             "club": "清水エスパルス",
             "section": section,
             "match_date": f"{int(am.group(1))}/{int(am.group(2))}",
-            "opponent": opponent,
+            "opponent": normalize_opponent(opponent),
             "venue": venue,
             "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
@@ -283,8 +289,13 @@ ALL_CLUB_FULL_NAMES = sorted(set(CLUB_ABBR.keys()), key=len, reverse=True)
 
 
 def find_opponent_name(text: str) -> str | None:
+    """
+    テキスト中に含まれる既知のクラブ名(フルネーム)を返す。
+    「ＦＣ町田ゼルビア」のような全角表記でも一致するよう、両方をNFKCで揃えて比較する。
+    """
+    t = nfkc(text)
     for name in ALL_CLUB_FULL_NAMES:
-        if name in text:
+        if nfkc(name) in t:
             return name
     return None
 
@@ -293,29 +304,40 @@ def find_opponent_name(text: str) -> str | None:
 def parse_sanga(html: str) -> list[dict]:
     """
     sanga-fc.jp/ticket/schedule を解析する。
-    「第N節」を区切りにブロック化し、各ブロック内の「一般販売」行から日付を取得する。
-    対戦相手はブロック先頭付近に含まれるクラブ名(既知のクラブ名リスト)で特定する。
-    販売日程がまだ無い試合(「試合開催日決定後、...」等)はスキップする。
+    画面上は試合名をクリックすると販売日程が開く作りだが、これは表示/非表示の切り替えだけで、
+    全試合の販売日程の表は最初からHTMLに含まれている(クリック操作は不要)。
+    1試合ごとの並び(NFKC後):
+        明治安田J1リーグ                     ← 大会名(ACLは「AFCチャンピオンズリーグElite / リーグステージ」)
+        第9節 10.10 (土) 19:00 FC町田ゼルビア
+        受付・販売種別 | ... | 一般販売 (販売中) | 9月26日(土) 12:00～
+    「第N節」を区切りにし、各区間の中の「一般販売」の日時を拾う。
+    販売日程がまだ無い試合(「試合開催日決定後、...」や表が無いもの)はスキップする。
     """
-    text = text_with_img_alts(html)
+    text = nfkc(text_with_img_alts(html))
 
-    blocks = re.split(r"第(\d+節)", text)
+    anchors = list(re.finditer(r"第(\d+)節", text))
     rows = []
-    # re.splitで奇数インデックスに節番号、偶数インデックスにその前後のテキストが入る
-    for i in range(1, len(blocks), 2):
-        section = blocks[i]
-        body = blocks[i + 1] if i + 1 < len(blocks) else ""
-        head = body[:200]  # 日付・対戦相手はブロック冒頭付近にあるはず
+    for idx, am in enumerate(anchors):
+        end_pos = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
+        body = text[am.end():end_pos]
+        head = body[:150]  # 日付・キックオフ・対戦相手は「第N節」の直後にある
+
+        # 大会名は「第N節」の直前の1〜2行
+        prev_end = anchors[idx - 1].end() if idx > 0 else 0
+        pre_lines = [ln.strip() for ln in text[prev_end:am.start()].splitlines() if ln.strip()]
+        section = extract_section(" ".join(pre_lines[-2:] + [am.group(0)]))
 
         date_m = re.search(r"(\d{1,2})\.(\d{1,2})", head)
         opponent = find_opponent_name(head)
+        if not opponent:
+            # ACLの海外クラブ等、既知のクラブ名リストに無い相手は「キックオフ時刻(または未定)の後ろ」を相手名とみなす
+            opp_m = re.search(r"(?:\d{1,2}:\d{2}|キックオフ未定)\s*([^\n|]+)", head)
+            opponent = opp_m.group(1).strip() if opp_m else None
 
-        # 「一般販売」の直後、多少余計な文字(罫線・「販売中」等)が挟まっても
-        # 最初に現れる日付+時刻パターンを拾う
         general_m = None
-        gm_idx = body.rfind("一般販売")
+        gm_idx = body.find("一般販売")
         if gm_idx != -1:
-            window = body[gm_idx: gm_idx + 150]
+            window = body[gm_idx: gm_idx + 100]
             general_m = re.search(r"(\d{1,2})月(\d{1,2})日[^\d]*?(\d{1,2}:\d{2})", window)
 
         if not (date_m and opponent and general_m):
@@ -323,9 +345,10 @@ def parse_sanga(html: str) -> list[dict]:
 
         rows.append({
             "club": "京都サンガF.C.",
-            "section": f"第{section}",
+            "section": section,
+            # 日程未確定の試合は「2.13(土) or 2.14(日)」のように候補日が2つあるが、1つ目を使う
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
-            "opponent": opponent,
+            "opponent": normalize_opponent(opponent),
             "venue": "",
             "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
@@ -600,7 +623,10 @@ def extract_section(text: str) -> str:
     if re.search(r"AFC|ACL", t):
         name = "ACL2" if re.search(r"Two|ACL\s*2", t) else "ACLE"
         md = re.search(r"MD\s*(\d+)", t)
-        return f"{name} MD{md.group(1)}" if md else f"{name}{rnd}"
+        if md:
+            return f"{name} MD{md.group(1)}"
+        sec = re.search(r"第\s*(\d+)\s*節", t)  # 京都の表記「リーグステージ 第2節」
+        return f"{name} 第{int(sec.group(1))}節" if sec else f"{name}{rnd}"
     m = re.search(r"第\s*(\d+)\s*節", t)
     if m:
         prefix = "U-21 " if re.search(r"U-?21", t) else ""
@@ -975,7 +1001,23 @@ SALE_SOURCES = [
         "club": "東京ヴェルディ",
         "collector": collect_verdy,
     },
-    # 清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
+    {
+        "club": "清水エスパルス",
+        "url": "https://www.s-pulse.co.jp/tickets/schedule",
+        "parser": parse_spulse,
+        "expect_marker": "一般販売",
+        # GitHub Actions(クラウドのIP)からのアクセスが拒否される場合に、
+        # Google Apps Script 経由の取得に切り替える(SALE_WATCH_PROXY_URL 設定時のみ)
+        "proxy_fallback": True,
+    },
+    {
+        "club": "京都サンガF.C.",
+        "url": "https://www.sanga-fc.jp/ticket/schedule",
+        "parser": parse_sanga,
+        "expect_marker": "一般販売",
+        "proxy_fallback": True,
+    },
+    # (旧メモ)清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
     # 一旦対象から外している。パーサー自体(parse_spulse / parse_sanga)は残してあるので、
     # 将来別の取得方法が見つかれば再度有効化できる。
@@ -983,6 +1025,29 @@ SALE_SOURCES = [
 
 
 DEBUG_TEXT_DUMP = os.environ.get("SALE_WATCH_DEBUG") == "1"
+
+
+# Google Apps Script(GAS)で作った取得用Webアプリ。GitHub Actions のIPが拒否されるサイト向け。
+# 未設定なら使わない。GitHub の Secrets に登録し、ワークフローの env で渡す。
+PROXY_URL = os.environ.get("SALE_WATCH_PROXY_URL", "").strip()
+PROXY_KEY = os.environ.get("SALE_WATCH_PROXY_KEY", "").strip()
+
+
+def fetch_via_proxy(url: str) -> str | None:
+    """GAS経由でページを取得する(Googleのサーバーから取りに行くので、IP単位の拒否を回避できることがある)"""
+    if not PROXY_URL:
+        return None
+    try:
+        resp = requests.get(PROXY_URL, params={"url": url, "key": PROXY_KEY}, timeout=60)
+        resp.raise_for_status()
+        text = decode_response(resp)
+        if text.startswith("ERROR:"):
+            print(f"[WARN] プロキシ側でエラー: {url} ({text[:200]})")
+            return None
+        return text
+    except requests.RequestException as e:
+        print(f"[WARN] プロキシ経由の取得に失敗: {url} ({e})")
+        return None
 
 
 def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8) -> str | None:
@@ -1007,6 +1072,14 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
               f"{delay}秒待って再取得します({attempt}/{max_attempts})")
         if attempt < max_attempts:
             time.sleep(delay)
+
+    # 直接取得でうまくいかなかったサイトは、設定があればGAS経由で取り直す
+    if source.get("proxy_fallback") and PROXY_URL:
+        print(f"[INFO] {source['club']}: Google Apps Script 経由で取得を試みます")
+        proxied = fetch_via_proxy(source["url"])
+        if proxied and (not marker or marker in proxied):
+            return proxied
+        print(f"[WARN] {source['club']}: プロキシ経由でも目印「{marker}」が見つかりませんでした")
 
     return html  # 最終的に目印が無くても、最後に取得できた内容をそのまま返す(呼び出し側で0件になるだけ)
 
