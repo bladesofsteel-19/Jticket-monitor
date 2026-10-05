@@ -314,8 +314,12 @@ def parse_sanga(html: str) -> list[dict]:
     販売日程がまだ無い試合(「試合開催日決定後、...」や表が無いもの)はスキップする。
     """
     text = nfkc(text_with_img_alts(html))
+    # 実際のHTMLはインデント用の空白が非常に多く(「第4節」の後に500文字以上の空白が続く)、
+    # 「第N節の直後150文字」に日付や相手名が収まらなかったため、空白と空行を詰めてから扱う
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n[\s]*", "\n", text)
 
-    anchors = list(re.finditer(r"第(\d+)節", text))
+    anchors = list(re.finditer(r"第\s*(\d+)\s*節", text))
     rows = []
     for idx, am in enumerate(anchors):
         end_pos = anchors[idx + 1].start() if idx + 1 < len(anchors) else len(text)
