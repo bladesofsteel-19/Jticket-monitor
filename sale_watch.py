@@ -419,6 +419,71 @@ def parse_urawa(html: str) -> list[dict]:
     return rows
 
 
+# ── 川崎フロンターレ ──────────────────────────────────────────
+TICKET_TITLE_RE = re.compile(r"^\d{1,2}/\d{1,2}\s*\S+?「チケット販売」のお知らせ$")
+
+
+def collect_frontale() -> list[dict]:
+    """
+    frontale.co.jp は専用の発売日一覧ページがJSで空のままだったため、
+    ニュース一覧(または記事内の「関連するお知らせ」)から
+    「M/D 相手「チケット販売」のお知らせ」という記事を見つけて個別に読む。
+    """
+    seed_urls = [
+        "https://www.frontale.co.jp/info/index.html",
+        "https://www.frontale.co.jp/info/ticket/",
+    ]
+    list_html = None
+    for seed in seed_urls:
+        list_html = fetch(seed)
+        if list_html:
+            break
+    if not list_html:
+        print("[WARN] 川崎フロンターレ: ニュース一覧の取得に失敗しました")
+        return []
+
+    soup = BeautifulSoup(list_html, "html.parser")
+    links = []
+    for a in soup.find_all("a", href=True):
+        title = a.get_text(strip=True)
+        if TICKET_TITLE_RE.match(title):
+            href = a["href"]
+            full_url = href if href.startswith("http") else f"https://www.frontale.co.jp{href}"
+            if full_url not in links:
+                links.append(full_url)
+    links = links[:10]  # 直近いくつかだけ
+
+    rows = []
+    for url in links:
+        html = fetch(url)
+        if not html:
+            continue
+        text = text_with_img_alts(html)
+
+        match_m = re.search(
+            r"(\d{1,2})月(\d{1,2})日[^\n]*?第\d+節\s*(\S+?)戦",
+            text[:2000],
+        )
+        general_m = re.search(
+            r"一般[：:]\s*(\d{1,2})月(\d{1,2})日[^\d]*?(\d{1,2}:\d{2})",
+            text,
+        )
+        if not (match_m and general_m):
+            continue
+
+        rows.append({
+            "club": "川崎フロンターレ",
+            "section": "",
+            "match_date": f"{int(match_m.group(1))}/{int(match_m.group(2))}",
+            "opponent": dedupe_name(match_m.group(3)),
+            "venue": "",
+            "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
+        })
+        time.sleep(1)
+
+    return rows
+
+
 # ── 対象クラブ一覧 ──────────────────────────────────────────
 SALE_SOURCES = [
     {
@@ -456,6 +521,10 @@ SALE_SOURCES = [
         "url": "https://www.urawa-reds.co.jp/ticket/saleperiod.html",
         "parser": parse_urawa,
         "expect_marker": "一般販売",
+    },
+    {
+        "club": "川崎フロンターレ",
+        "collector": collect_frontale,
     },
     # 清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
@@ -496,6 +565,14 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
 def collect_all() -> list[dict]:
     all_rows = []
     for source in SALE_SOURCES:
+        if "collector" in source:
+            # 1ページでは完結しない(ニュース記事を複数巡回する)クラブ用
+            print(f"[INFO] checking {source['club']} (collector)")
+            rows = source["collector"]()
+            print(f"[INFO] {source['club']}: {len(rows)}件取得")
+            all_rows.extend(rows)
+            continue
+
         print(f"[INFO] checking {source['club']} ({source['url']})")
         html = fetch_with_marker_retry(source)
         if not html:
