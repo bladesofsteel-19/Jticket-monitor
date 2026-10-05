@@ -88,6 +88,10 @@ def fetch_with_playwright(url: str) -> str | None:
             )
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=30000)
+            # 遅延読み込み(スクロールで初めて表示される)対策として、
+            # 下までスクロールしてから少し待つ
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(3000)
             content = page.content()
             browser.close()
             return content
