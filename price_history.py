@@ -203,12 +203,57 @@ def to_serial(d: date) -> int:
     return (d - date(1899, 12, 30)).days
 
 
-def from_cell_date(v) -> int | None:
-    """A列の値(シリアル値、または旧形式の「2026-10-05 06:00」)をシリアル値に"""
+def from_cell_date(v, match_day: date) -> int | None:
+    """
+    A列の値をシリアル値に。表示値の「10/05」(年なし)は、試合日以前の直近の日付として年を補う。
+    旧形式の「2026-10-05 06:00」やシリアル値にも対応。
+    """
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         return int(v)
-    d = parse_full_date(str(v))
+    d = parse_full_date(str(v)) or parse_md_near(str(v), match_day)
     return to_serial(d) if d else None
+
+
+PRICE_DISPLAY_RE = re.compile(r"^([\d,]+)\s*(.*)$")
+
+
+def price_cell(display: str) -> dict:
+    """
+    「4,000 [変動] 完売」のような表示用の文字列を、数値+表示形式のセルにする。
+    セルの中身は数値(4000)のまま、表示形式で「4,000 [変動] 完売」と見せるので、
+    右寄せ・カンマ区切りになり、計算や条件付き書式でもそのまま数値として扱える。
+    """
+    m = PRICE_DISPLAY_RE.match(display or "")
+    if not m:
+        return {"userEnteredValue": {"stringValue": display}} if display else {}
+    number = int(m.group(1).replace(",", ""))
+    suffix = m.group(2).strip().replace('"', "")
+    pattern = "#,##0" + (f'" {suffix}"' if suffix else "")
+    return {"userEnteredValue": {"numberValue": number},
+            "userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": pattern}}}
+
+
+def table_to_update_request(sheet_id: int, table: list[list]) -> dict:
+    """表全体を1回で書き込むリクエスト(1行目=文字、A列=日付、価格=数値+表示形式)"""
+    width = max(len(r) for r in table)
+    rows = []
+    for ri, r in enumerate(table):
+        cells = []
+        for ci in range(width):
+            v = r[ci] if ci < len(r) else ""
+            if ri == 0:
+                cells.append({"userEnteredValue": {"stringValue": str(v)}} if v != "" else {})
+            elif ci == 0 and isinstance(v, int):
+                cells.append({"userEnteredValue": {"numberValue": v},
+                              "userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "MM/dd"}}})
+            else:
+                cells.append(price_cell(str(v)))
+        rows.append({"values": cells})
+    return {"updateCells": {
+        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": len(table),
+                  "startColumnIndex": 0, "endColumnIndex": width},
+        "rows": rows,
+        "fields": "userEnteredValue,userEnteredFormat.numberFormat"}}
 
 
 def sale_label(sale_day: date | None) -> str:
@@ -245,10 +290,11 @@ def merge_columns(headers: list[str], page_order: list[str]) -> list[tuple[int, 
     return inserts
 
 
-def build_updated_table(values: list[list], seats: list[dict], today: date,
-                        label: str) -> tuple[list[list], bool] | tuple[None, bool]:
+def build_updated_table(values: list[list], seats: list[dict], today: date, label: str,
+                        match_day: date) -> tuple[list[list], bool] | tuple[None, bool]:
     """
-    シートの現在の内容(values: 書式なしの値)に今回の結果を反映した表を返す。
+    シートの現在の内容(values: 画面に表示されている値)に今回の結果を反映した表を返す。
+    価格は表示の文字列(「4,000 [変動]」)のまま比べ、書き込むときに数値+表示形式に変換する。
     戻り値: (新しい表, 旧形式から移行したか)。前回の行から変化が無ければ (None, False)。
     表の形:
       1行目 = [「発売日：MM/DD」, 席種1, 席種2, ...]
@@ -279,7 +325,7 @@ def build_updated_table(values: list[list], seats: list[dict], today: date,
         r = list(r) + [""] * (width - len(r))
         if not any(str(c).strip() for c in r):
             continue
-        serial = from_cell_date(r[0])
+        serial = from_cell_date(r[0], match_day)
         cells = [str(c).strip() for c in r[1:width]]
         if migrated:
             # 旧形式の「6,800～7,800」は最高価格だけにする
@@ -317,10 +363,8 @@ def hex_color(h: str) -> dict:
 
 
 def price_diff_formula(op: str) -> str:
-    """1つ上の行(前回の記録)との価格差で判定する式。[変動]・完売などの文字は除いて数値だけ比べる"""
-    cur = 'VALUE(SUBSTITUTE(REGEXEXTRACT(TO_TEXT(B3),"[0-9,]+"),",",""))'
-    prev = 'VALUE(SUBSTITUTE(REGEXEXTRACT(TO_TEXT(B2),"[0-9,]+"),",",""))'
-    return f"=IFERROR({op.format(d=f'({cur}-{prev})')},FALSE)"
+    """1つ上の行(前回の記録)との価格差で判定する式。価格は数値なので、そのまま引き算で比べる"""
+    return f"=AND(ISNUMBER(B3),ISNUMBER(B2),{op.format(d='(B3-B2)')})"
 
 
 def formatting_requests(sheet_id: int) -> list[dict]:
@@ -339,10 +383,10 @@ def formatting_requests(sheet_id: int) -> list[dict]:
             "format": fmt}}
 
     rules = [
-        # 日付: 日曜・祝日=赤、土曜=青(祝日の土曜は赤を優先)
+        # 日付: 日曜・祝日=赤、土曜=青の背景色(祝日の土曜は赤を優先)
         rule(date_range, f'=AND($A2<>"",OR(WEEKDAY($A2)=1,COUNTIF(INDIRECT("{HOLIDAY_SHEET_NAME}!A:A"),$A2)>0))',
-             text="#CC0000"),
-        rule(date_range, '=AND($A2<>"",WEEKDAY($A2)=7)', text="#1155CC"),
+             bg="#F8CBAD"),
+        rule(date_range, '=AND($A2<>"",WEEKDAY($A2)=7)', bg="#BDD7EE"),
         # 価格: 前回より500円以上上がった=濃い赤、500円未満上がった=薄い赤、下がった場合は青
         rule(price_range, price_diff_formula("{d}>=500"), text="#FFFFFF", bg="#C00000", bold=True),
         rule(price_range, price_diff_formula("AND({d}>0,{d}<500)"), bg="#F4CCCC"),
@@ -367,15 +411,13 @@ def clear_conditional_formats_requests(sh, sheet_id: int) -> list[dict]:
     return []
 
 
-def read_unformatted(ws) -> list[list]:
-    """日付をシリアル値のまま読む(表示形式「MM/dd」だと年が失われるため)"""
-    from gspread.utils import rowcol_to_a1
-    rng = f"A1:{rowcol_to_a1(ws.row_count, ws.col_count)}"
-    return retry_on_transient_error(ws.get, rng, value_render_option="UNFORMATTED_VALUE") or []
+def read_displayed(ws) -> list[list]:
+    """画面に表示されている値で読む(価格の「[変動]」「完売」は表示形式に入っているため)"""
+    return retry_on_transient_error(ws.get_all_values) or []
 
 
 def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
-                      seats: list[dict], today: date, label: str) -> tuple[bool, bool]:
+                      seats: list[dict], today: date, label: str, match_day: date) -> tuple[bool, bool]:
     """
     1試合分を書き込む。戻り値: (シートを新規作成したか, 行を追記・更新したか)
     既存シートはシート名の先頭(「MMDD 相手」)で探すので、後から会場名が変わっても同じシートに書く。
@@ -393,9 +435,9 @@ def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
         created = True
         values = []
     else:
-        values = read_unformatted(ws)
+        values = read_displayed(ws)
 
-    table, migrated = build_updated_table(values, seats, today, label)
+    table, migrated = build_updated_table(values, seats, today, label, match_day)
     if table is None:
         return created, False
 
@@ -408,16 +450,95 @@ def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
         )
     if migrated:
         retry_on_transient_error(ws.clear)
-    # RAW で書くので、日付(数値)は日付のまま、価格(文字列)は「6,500」の表記のまま入る
-    retry_on_transient_error(ws.update, values=table, range_name="A1")
-
+    reqs = [table_to_update_request(ws.id, table)]
     if created or migrated:
-        reqs = []
         if migrated:
             reqs += clear_conditional_formats_requests(sh, ws.id)
         reqs += formatting_requests(ws.id)
-        retry_on_transient_error(sh.batch_update, {"requests": reqs})
+    retry_on_transient_error(sh.batch_update, {"requests": reqs})
     return created, True
+
+
+def _rule_signature(rule: dict) -> tuple:
+    """条件付き書式の比較用(APIは0の色成分を省略して返すので、丸めて揃える)"""
+    br = rule.get("booleanRule", {})
+    formula = br.get("condition", {}).get("values", [{}])[0].get("userEnteredValue", "")
+    fmt = br.get("format", {})
+
+    def color(c):
+        c = c or {}
+        return tuple(round(c.get(k, 0), 2) for k in ("red", "green", "blue"))
+
+    text = fmt.get("textFormat", {})
+    return (formula, color(fmt.get("backgroundColor")),
+            color(text.get("foregroundColor")) if "foregroundColor" in text else None,
+            bool(text.get("bold", False)))
+
+
+def match_day_from_title(title: str, today: date) -> date | None:
+    """シート名「1021 C大阪_豊田ス」の MMDD から、今日に最も近い年の日付を求める"""
+    m = re.match(r"^(\d{2})(\d{2}) ", title)
+    if not m:
+        return None
+    cands = []
+    for y in (today.year - 1, today.year, today.year + 1):
+        try:
+            cands.append(date(y, int(m.group(1)), int(m.group(2))))
+        except ValueError:
+            pass
+    return min(cands, key=lambda d: abs((d - today).days)) if cands else None
+
+
+def rewrite_values_requests(ws, today: date) -> list[dict]:
+    """
+    既存シートの値を今の形式(日付=日付、価格=数値+表示形式)で書き直すリクエスト。
+    以前の版で価格を文字列として書いていたシートを、数値に変換するために使う。
+    """
+    values = read_displayed(ws)
+    if not values or not str(values[0][0]).startswith(SALE_LABEL_PREFIX):
+        return []
+    match_day = match_day_from_title(ws.title, today)
+    if not match_day:
+        return []
+    width = len(values[0])
+    table = [[str(c) for c in values[0]]]
+    for r in values[1:]:
+        r = list(r) + [""] * (width - len(r))
+        if not any(str(c).strip() for c in r):
+            continue
+        serial = from_cell_date(r[0], match_day)
+        table.append([serial if serial is not None else r[0]] + [str(c).strip() for c in r[1:width]])
+    return [table_to_update_request(ws.id, table)]
+
+
+def refresh_formatting(sh, name_to_ws: dict, today: date):
+    """
+    ファイル内の試合シートの条件付き書式が今の設定と違っていれば付け直す
+    (色や判定方法を変えたときに、既存のシートにも反映させるため)。メタデータの取得は1ファイル1回。
+    付け直すシートは、値も今の形式で書き直す(価格の文字列→数値の変換もここで行われる)。
+    """
+    meta = retry_on_transient_error(sh.fetch_sheet_metadata)
+    ws_by_id = {w.id: w for w in name_to_ws.values()}
+    reqs = []
+    fixed = 0
+    for sheet in meta.get("sheets", []):
+        props = sheet["properties"]
+        if sheet_sort_key(props.get("title", ""))[0] != 1:
+            continue
+        sid = props["sheetId"]
+        expected = [r["addConditionalFormatRule"]["rule"] for r in formatting_requests(sid)
+                    if "addConditionalFormatRule" in r]
+        current = sheet.get("conditionalFormats", [])
+        if [_rule_signature(r) for r in current] == [_rule_signature(r) for r in expected]:
+            continue
+        if sid in ws_by_id:
+            reqs += rewrite_values_requests(ws_by_id[sid], today)
+        reqs += [{"deleteConditionalFormatRule": {"sheetId": sid, "index": 0}} for _ in current]
+        reqs += formatting_requests(sid)
+        fixed += 1
+    if reqs:
+        retry_on_transient_error(sh.batch_update, {"requests": reqs})
+        print(f"[INFO] 価格履歴: {fixed}シートの条件付き書式を更新しました")
 
 
 def japanese_holidays(years: list[int]) -> list[date]:
@@ -546,7 +667,7 @@ def record_price_history(all_rows: list[dict], abbr_map: dict | None = None):
                 opened[url] = (book, {w.title: w for w in ws_list})
             book, name_to_ws = opened[url]
             created, appended = write_match_sheet(
-                book, name_to_ws, prefix, title, seats, today, sale_label(sale_day)
+                book, name_to_ws, prefix, title, seats, today, sale_label(sale_day), match_day
             )
             if created or appended:
                 touched_files.add(url)
@@ -563,6 +684,11 @@ def record_price_history(all_rows: list[dict], abbr_map: dict | None = None):
             tidy_spreadsheet(opened[url][0], holidays)
         except Exception as e:
             print(f"[WARN] 価格履歴: シートの並び替えに失敗しました ({e})")
+    for url, (book, names) in opened.items():
+        try:
+            refresh_formatting(book, names, today)
+        except Exception as e:
+            print(f"[WARN] 価格履歴: 条件付き書式の更新に失敗しました ({e})")
 
     for v in sorted(unknown_venues):
         print(f"[WARN] スタジアム略称が未登録: {v}(「{VENUE_SHEET_NAME}」シートに追加すると次回から略称になります)")
