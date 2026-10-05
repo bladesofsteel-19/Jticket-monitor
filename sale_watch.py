@@ -12,6 +12,7 @@ Google Sheetsまわりの接続処理は monitor.py のものをそのまま再�
   アビスパ福岡 / 浦和レッズ / 名古屋グランパス
 - 記事巡回方式(collector): 川崎フロンターレ(Playwright必須) / 東京ヴェルディ(requestsのみ)
 - 1ページ解析方式(GAS経由の取得にも対応): 清水エスパルス / 京都サンガF.C.
+- 1ページ解析方式: ヴィッセル神戸
 
 他のクラブは、それぞれ公式サイトの形式を個別に確認しながら追加していく。
 """
@@ -526,6 +527,76 @@ def parse_urawa(html: str) -> list[dict]:
     return rows
 
 
+# ── ヴィッセル神戸 ──────────────────────────────────────────
+# 公式サイトの注記:「販売開始時間はロイヤル、レギュラー、一般販売は10:00～」
+VISSEL_DEFAULT_SALE_TIME = "10:00"
+
+
+def parse_vissel(html: str) -> list[dict]:
+    """
+    vissel-kobe.co.jp/ticket/schedule/ を解析する。
+    1試合ごとの並び(NFKC・空白整理後):
+        明治安田J1リーグ        ← 大会ロゴのalt(ACLは「ACL Elite」)
+        第12節                  ← ACLは「MD2」
+        10/24 (土)
+        15:00
+        町田 町田               ← エンブレムのalt + クラブ名(略称)
+        ノエスタ                ← スタジアム
+        ロイヤル: 販売中 ... 一般: 販売中   または   一般: 10/14(水)
+        試合情報 >              ← 各試合の末尾。これを区切りにする
+    一般販売の欄には日付しか無いので、時刻は公式サイト記載の10:00を補う。
+    すでに発売済みの試合は日付が消えて「販売中」になるため、その場合は「販売中」と出力する。
+    """
+    text = nfkc(text_with_img_alts(html))
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n[\s]*", "\n", text)
+
+    rows = []
+    for block in re.split(r"試合情報\s*>", text)[:-1]:
+        # 試合日 = 「日付(曜)」の次の行がキックオフ時刻のもの(販売日の「10/10(土)」と区別するため)
+        dms = list(re.finditer(
+            r"(\d{1,2})/(\d{1,2})\s*\([^)]*\)\s*\n\s*(?:\d{1,2}:\d{2}|未定|-+)", block))
+        if not dms:
+            continue
+        dm = dms[-1]
+
+        pre_lines = [ln.strip() for ln in block[:dm.start()].splitlines() if ln.strip()]
+        section = extract_section(" ".join(pre_lines[-2:])) if pre_lines else ""
+
+        # 日付・キックオフの後ろ: 相手名(エンブレムのaltと重複することがある) → スタジアム → 販売日程
+        after_lines = []
+        for ln in block[dm.end():].splitlines():
+            ln = ln.strip()
+            if ln and (not after_lines or after_lines[-1] != ln):
+                after_lines.append(ln)
+        if len(after_lines) < 2:
+            continue
+        opponent = normalize_opponent(dedupe_name(after_lines[0]))
+        venue = after_lines[1]
+
+        general_m = re.search(r"一般\s*[:：]\s*([^\n]+)", block[dm.end():])
+        if not general_m:
+            continue
+        general_raw = general_m.group(1).strip()
+        date_m = re.search(r"(\d{1,2})/(\d{1,2})", general_raw)
+        if date_m:
+            general = f"{int(date_m.group(1))}/{int(date_m.group(2))} {VISSEL_DEFAULT_SALE_TIME}"
+        elif "販売中" in general_raw:
+            general = "販売中"
+        else:
+            continue  # 「未定」等
+
+        rows.append({
+            "club": "ヴィッセル神戸",
+            "section": section,
+            "match_date": f"{int(dm.group(1))}/{int(dm.group(2))}",
+            "opponent": opponent,
+            "venue": venue,
+            "general_sale": general,
+        })
+    return rows
+
+
 # ── 川崎フロンターレ ──────────────────────────────────────────
 TICKET_TITLE_PHRASE = "「チケット販売」のお知らせ"
 
@@ -1011,6 +1082,12 @@ SALE_SOURCES = [
         "expect_marker": "一般販売",
         "proxy_fallback": True,
     },
+    {
+        "club": "ヴィッセル神戸",
+        "url": "https://www.vissel-kobe.co.jp/ticket/schedule/",
+        "parser": parse_vissel,
+        "expect_marker": "チケット販売スケジュール",
+    },
     # (旧メモ)清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
     # 一旦対象から外している。パーサー自体(parse_spulse / parse_sanga)は残してあるので、
@@ -1096,6 +1173,8 @@ VENUE_FULL_NAMES = {
     "サンガS": "サンガスタジアム by KYOCERA",
     "パナスタ": "パナソニックスタジアム吹田",
     "吹田S": "市立吹田サッカースタジアム",
+    "ノエスタ": "ノエビアスタジアム神戸",
+    "御崎公園": "御崎公園球技場",  # ACLでの名称(ノエビアスタジアム神戸と同じ会場)
 }
 
 
