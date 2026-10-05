@@ -574,6 +574,19 @@ def table_header_candidates(df: pd.DataFrame):
         yield [_flat_col(c) for c in df.iloc[0].tolist()], df.iloc[1:]
 
 
+def read_tables(html: str) -> list[pd.DataFrame]:
+    """
+    pd.read_html の安全版。表が1つも無いページでは空リストを返す。
+    flavor="lxml" を明示しているのは、lxmlで表が見つからなかった場合に
+    pandasが bs4+html5lib へ自動で切り替えようとし、html5lib未インストールで
+    ImportError になって全体が止まるのを防ぐため。
+    """
+    try:
+        return pd.read_html(io.StringIO(html), flavor="lxml")
+    except (ValueError, ImportError):
+        return []
+
+
 def find_col(cols: list[str], *keywords: str) -> int | None:
     """列名リストから、いずれかのキーワードを含む最初の列番号を返す"""
     for i, c in enumerate(cols):
@@ -648,10 +661,7 @@ def parse_grampus(html: str) -> list[dict]:
         ファンクラブ優先 / 一般販売 / 駐車場販売 / ファンクラブ特典招待券 / 観戦様式
     列の並びが変わっても動くよう、列番号ではなく列名(見出し)で位置を特定する。
     """
-    try:
-        tables = pd.read_html(io.StringIO(html))
-    except ValueError:
-        return []
+    tables = read_tables(html)
 
     rows = []
     for raw_df in tables:
@@ -710,10 +720,7 @@ def parse_verdy_article(html: str) -> list[dict]:
     記事によって列構成が違うため、列名で位置を特定する。
     同じ記事内の価格表にも「一般販売」列があるが、「対戦」列が無いので除外される。
     """
-    try:
-        tables = pd.read_html(io.StringIO(html))
-    except ValueError:
-        return []
+    tables = read_tables(html)
 
     rows = []
     for raw_df in tables:
@@ -785,7 +792,11 @@ def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
         html = fetch(url)
         if not html:
             continue
-        article_rows = parse_verdy_article(html)
+        try:
+            article_rows = parse_verdy_article(html)
+        except Exception as e:
+            print(f"[WARN] 東京ヴェルディ: {url} の解析中にエラー({e})")
+            article_rows = []
         if not article_rows and DEBUG_TEXT_DUMP:
             print(f"[DEBUG] 東京ヴェルディ: {url} から販売スケジュール表を読み取れませんでした")
             print(repr(text_with_img_alts(html)[:1500]))
@@ -897,38 +908,46 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
 def collect_all() -> list[dict]:
     all_rows = []
     for source in SALE_SOURCES:
-        if "collector" in source:
-            # 1ページでは完結しない(ニュース記事を複数巡回する)クラブ用
-            print(f"[INFO] checking {source['club']} (collector)")
-            rows = source["collector"]()
-            print(f"[INFO] {source['club']}: {len(rows)}件取得")
-            all_rows.extend(rows)
-            continue
-
-        print(f"[INFO] checking {source['club']} ({source['url']})")
-        html = fetch_with_marker_retry(source)
-        if not html:
-            continue
-
-        if DEBUG_TEXT_DUMP:
-            full_text = text_with_img_alts(html)
-            marker = source.get("expect_marker")
-            idx = full_text.find(marker) if marker else -1
-            if idx != -1:
-                start = max(0, idx - 400)
-                sample = full_text[start: start + 1800]
-                label = f"「{marker}」の周辺"
-            else:
-                sample = full_text[:1500]
-                label = "先頭1500文字(目印が見つからなかったため)"
-            print(f"[DEBUG] ---- {source['club']} の実際のテキスト({label}) ----")
-            print(repr(sample))
-            print("[DEBUG] ---- ここまで ----")
-
-        rows = source["parser"](html)
-        print(f"[INFO] {source['club']}: {len(rows)}件取得")
-        all_rows.extend(rows)
+        # 1クラブで想定外のエラーが起きても、他のクラブの取得とシート書き出しは続ける
+        try:
+            all_rows.extend(collect_one(source))
+        except Exception as e:
+            print(f"[WARN] {source['club']}: 取得中にエラーが発生したためスキップします ({type(e).__name__}: {e})")
     return all_rows
+
+
+def collect_one(source: dict) -> list[dict]:
+    """1クラブ分の発売予定を取得する"""
+    if "collector" in source:
+        # 1ページでは完結しない(ニュース記事を複数巡回する)クラブ用
+        print(f"[INFO] checking {source['club']} (collector)")
+        rows = source["collector"]()
+        print(f"[INFO] {source['club']}: {len(rows)}件取得")
+        return rows
+
+    print(f"[INFO] checking {source['club']} ({source['url']})")
+    html = fetch_with_marker_retry(source)
+    if not html:
+        return []
+
+    if DEBUG_TEXT_DUMP:
+        full_text = text_with_img_alts(html)
+        marker = source.get("expect_marker")
+        idx = full_text.find(marker) if marker else -1
+        if idx != -1:
+            start = max(0, idx - 400)
+            sample = full_text[start: start + 1800]
+            label = f"「{marker}」の周辺"
+        else:
+            sample = full_text[:1500]
+            label = "先頭1500文字(目印が見つからなかったため)"
+        print(f"[DEBUG] ---- {source['club']} の実際のテキスト({label}) ----")
+        print(repr(sample))
+        print("[DEBUG] ---- ここまで ----")
+
+    rows = source["parser"](html)
+    print(f"[INFO] {source['club']}: {len(rows)}件取得")
+    return rows
 
 
 def export_to_sheet(rows: list[dict]):
