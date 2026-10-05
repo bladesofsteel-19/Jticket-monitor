@@ -8,8 +8,10 @@ monitor.py(価格チェック)とは別の目的・別のスケジュールで�
 Google Sheetsまわりの接続処理は monitor.py のものをそのまま再利用する。
 
 【対応クラブ(現時点)】
-- FC町田ゼルビア: 専用の「チケット販売スケジュール」ページ(テキストブロック形式)
-- 横浜F・マリノス: 専用の「販売スケジュール」ページ(HTML表)
+- 1ページ解析方式(parser): FC町田ゼルビア / 横浜F・マリノス / ガンバ大阪 / セレッソ大阪 /
+  アビスパ福岡 / 浦和レッズ / 名古屋グランパス
+- 記事巡回方式(collector): 川崎フロンターレ(Playwright必須) / 東京ヴェルディ(requestsのみ)
+- 対象外(ボット対策で取得不可、パーサーは残置): 清水エスパルス / 京都サンガF.C.
 
 他のクラブは、それぞれ公式サイトの形式を個別に確認しながら追加していく。
 """
@@ -18,7 +20,9 @@ import io
 import os
 import re
 import time
-from datetime import datetime, timezone, timedelta
+import unicodedata
+from datetime import date, datetime, timezone, timedelta
+from urllib.parse import urljoin
 
 import pandas as pd
 import requests
@@ -546,6 +550,261 @@ def collect_frontale() -> list[dict]:
     return rows
 
 
+# ── 名古屋グランパス・東京ヴェルディ共通の補助関数 ─────────────────────
+def nfkc(s) -> str:
+    """全角数字・全角括弧・全角コロン等を半角に揃える(「10：00」→「10:00」など)"""
+    return unicodedata.normalize("NFKC", str(s)).strip()
+
+
+def _flat_col(c) -> str:
+    """表の列名を比較しやすい形にする(<br>由来の空白を除去、複数段ヘッダーは連結)"""
+    if isinstance(c, tuple):
+        c = " ".join(str(x) for x in c)
+    return re.sub(r"\s+", "", nfkc(c))
+
+
+def table_header_candidates(df: pd.DataFrame):
+    """
+    表の見出し候補を返す。見出しが<th>でなく<td>で書かれている表では、
+    pandasが見出し行を通常のデータ行として扱うため、1行目を見出しとみなす候補も返す。
+    戻り値: (列名リスト, データ部分のDataFrame) の候補を順に yield
+    """
+    yield [_flat_col(c) for c in df.columns], df
+    if len(df) > 0:
+        yield [_flat_col(c) for c in df.iloc[0].tolist()], df.iloc[1:]
+
+
+def find_col(cols: list[str], *keywords: str) -> int | None:
+    """列名リストから、いずれかのキーワードを含む最初の列番号を返す"""
+    for i, c in enumerate(cols):
+        if any(k in c for k in keywords):
+            return i
+    return None
+
+
+MATCH_DATE_RE = re.compile(r"(\d{1,2})(?:/|月)(\d{1,2})")
+SALE_DT_RE = re.compile(
+    r"(\d{1,2})(?:/|月)(\d{1,2})日?\s*\([^)]*\)\s*(?:(\d{1,2}):(\d{2}))?"
+)
+
+
+def parse_sale_datetime(cell: str, default_time: str | None = None) -> str | None:
+    """
+    「9/19（土） 10：00〜」「7月24日(金)12:00～」等を「9/19 10:00」形式にする。
+    時刻が書かれていない場合は default_time を補う(無ければ日付のみ)。
+    「─」等、日付が無いセルは None。
+    """
+    m = SALE_DT_RE.search(nfkc(cell))
+    if not m:
+        return None
+    md = f"{int(m.group(1))}/{int(m.group(2))}"
+    if m.group(3):
+        return f"{md} {int(m.group(3))}:{m.group(4)}"
+    return f"{md} {default_time}" if default_time else md
+
+
+def is_past_match(month: int, day: int, today: date | None = None) -> bool:
+    """
+    年の書かれていない「M/D」が、今日より前の試合かどうかを判定する。
+    シーズンが年をまたぐため、6か月以上離れた月は前年/翌年の試合とみなす。
+    """
+    today = today or datetime.now(JST).date()
+    year = today.year
+    if month < today.month - 6:
+        year += 1
+    elif month > today.month + 6:
+        year -= 1
+    try:
+        return date(year, month, day) < today
+    except ValueError:
+        return False
+
+
+def _build_abbr_to_full() -> dict[str, str]:
+    """CLUB_ABBR(フルネーム→略称)を逆引きできるようにする。「C大阪」→「セレッソ大阪」"""
+    table = {}
+    for full, abbr in CLUB_ABBR.items():
+        if isinstance(abbr, str) and abbr.strip():
+            table[nfkc(abbr)] = full
+    return table
+
+
+ABBR_TO_FULL = _build_abbr_to_full()
+
+
+def normalize_opponent(name: str) -> str:
+    """「C大阪戦」→「セレッソ大阪」。略称が変換表に無ければ「戦」を外しただけで返す"""
+    n = nfkc(name)
+    n = re.sub(r"^(東京ヴェルディ|名古屋グランパス)?\s*(vs\.?|VS\.?)\s*", "", n)
+    n = re.sub(r"戦$", "", n).strip()
+    return ABBR_TO_FULL.get(n, dedupe_name(n))
+
+
+# ── 名古屋グランパス ──────────────────────────────────────────
+def parse_grampus(html: str) -> list[dict]:
+    """
+    nagoya-grampus.jp/ticket/schedule/ のHTML表を解析する。
+    列: 大会 / 節 / 日にち / K.O. / 対戦相手 / 会場 / プラチナ優先 / ファンクラブ超優先 /
+        ファンクラブ優先 / 一般販売 / 駐車場販売 / ファンクラブ特典招待券 / 観戦様式
+    列の並びが変わっても動くよう、列番号ではなく列名(見出し)で位置を特定する。
+    """
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except ValueError:
+        return []
+
+    rows = []
+    for raw_df in tables:
+        for cols, df in table_header_candidates(raw_df):
+            i_gen = find_col(cols, "一般販売")
+            i_opp = find_col(cols, "対戦相手")
+            i_date = find_col(cols, "日にち", "開催日")
+            if None not in (i_gen, i_opp, i_date):
+                break
+        else:
+            continue  # 発売スケジュール以外の表
+        i_comp = find_col(cols, "大会")
+        i_sec = find_col(cols, "節")
+        i_venue = find_col(cols, "会場")
+
+        for _, r in df.iterrows():
+            cells = [nfkc(c) for c in r.tolist()]
+            date_m = MATCH_DATE_RE.search(cells[i_date])
+            general = parse_sale_datetime(cells[i_gen])
+            opponent = cells[i_opp]
+            if not (date_m and general and opponent and opponent.lower() != "nan"):
+                continue  # 「─」等、一般販売日が未定の試合はスキップ
+
+            comp = cells[i_comp] if i_comp is not None else ""
+            sec = cells[i_sec] if i_sec is not None else ""
+            section = comp
+            if re.fullmatch(r"\d+", sec):
+                section = f"{comp} 第{sec}節".strip()
+
+            venue = cells[i_venue] if i_venue is not None else ""
+            rows.append({
+                "club": "名古屋グランパス",
+                "section": section,
+                "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
+                "opponent": normalize_opponent(opponent),
+                "venue": "" if venue.lower() == "nan" else venue,
+                "general_sale": general,
+            })
+    return rows
+
+
+# ── 東京ヴェルディ ──────────────────────────────────────────
+VERDY_BASE = "https://www.verdy.co.jp"
+VERDY_LIST_URL = "https://www.verdy.co.jp/news/tag/top?p={page}"
+VERDY_TITLE_KEYWORD = "チケット販売"
+# U-21やベレーザ(女子)等、トップチームのJ1以外の試合の告知は除外する(NFKC正規化後の表記で判定)
+VERDY_EXCLUDE_WORDS = ("U-21", "U21", "ベレーザ", "ユース", "ジュニア")
+# 公式サイトの記載:「販売開始初日の販売開始時間は、会員割引・一般販売ともに12:00～」
+VERDY_DEFAULT_SALE_TIME = "12:00"
+
+
+def parse_verdy_article(html: str) -> list[dict]:
+    """
+    verdy.co.jp の「〇月ホームゲームチケット販売について」記事内の販売スケジュール表を解析する。
+    列: (節) / 開催日(または日時・開催日時) / キックオフ / 対戦相手(または対戦カード) / 会員販売 / 一般販売
+    記事によって列構成が違うため、列名で位置を特定する。
+    同じ記事内の価格表にも「一般販売」列があるが、「対戦」列が無いので除外される。
+    """
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except ValueError:
+        return []
+
+    rows = []
+    for raw_df in tables:
+        for cols, df in table_header_candidates(raw_df):
+            i_gen = find_col(cols, "一般販売")
+            i_opp = find_col(cols, "対戦相手", "対戦カード")
+            i_date = find_col(cols, "開催日", "日時", "日にち")
+            if None not in (i_gen, i_opp, i_date):
+                break
+        else:
+            continue  # 価格表など、販売スケジュール以外の表
+        i_sec = find_col(cols, "節")
+
+        for _, r in df.iterrows():
+            cells = [nfkc(c) for c in r.tolist()]
+            date_m = MATCH_DATE_RE.search(cells[i_date])
+            general = parse_sale_datetime(cells[i_gen], default_time=VERDY_DEFAULT_SALE_TIME)
+            opponent = cells[i_opp]
+            if not (date_m and general and opponent and opponent.lower() != "nan"):
+                continue
+
+            sec = cells[i_sec] if i_sec is not None else ""
+            rows.append({
+                "club": "東京ヴェルディ",
+                "section": f"第{sec}節" if re.fullmatch(r"\d+", sec) else "",
+                "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
+                "opponent": normalize_opponent(opponent),
+                "venue": "",
+                "general_sale": general,
+            })
+    return rows
+
+
+def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
+    """
+    verdy.co.jp は販売日程ページの表がJSで後から読み込まれるため、
+    ニュース一覧(ヴェルディ=トップチームのタグ)から「チケット販売」を含む記事を探して個別に読む。
+    一覧・記事とも素のHTMLに内容が含まれているので、Playwrightは使わず requests で取得する。
+    """
+    links = []
+    for page in range(1, max_pages + 1):
+        list_html = fetch(VERDY_LIST_URL.format(page=page))
+        if not list_html:
+            continue
+        soup = BeautifulSoup(list_html, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if not re.search(r"/news/\d+/?$", href.split("?")[0]):
+                continue
+            title = nfkc(a.get_text(" ", strip=True))
+            if VERDY_TITLE_KEYWORD not in title:
+                continue
+            if any(w in title for w in VERDY_EXCLUDE_WORDS):
+                continue
+            full_url = urljoin(VERDY_BASE, href)
+            if full_url not in links:
+                links.append(full_url)
+        if len(links) >= max_articles:
+            break
+        time.sleep(1)
+    links = links[:max_articles]  # 一覧は新しい順なので、先頭ほど新しい記事
+
+    if DEBUG_TEXT_DUMP:
+        print(f"[DEBUG] 東京ヴェルディ: リンク候補{len(links)}件: {links}")
+
+    rows = []
+    seen = set()
+    for url in links:
+        html = fetch(url)
+        if not html:
+            continue
+        article_rows = parse_verdy_article(html)
+        if not article_rows and DEBUG_TEXT_DUMP:
+            print(f"[DEBUG] 東京ヴェルディ: {url} から販売スケジュール表を読み取れませんでした")
+            print(repr(text_with_img_alts(html)[:1500]))
+
+        for row in article_rows:
+            # 同じ試合が複数の記事(更新版など)に載っている場合は、新しい記事の内容を優先する
+            key = (row["match_date"], row["opponent"])
+            if key in seen:
+                continue
+            month, day = map(int, row["match_date"].split("/"))
+            if is_past_match(month, day):
+                continue  # 過去の記事に載っている、既に終わった試合は除外
+            seen.add(key)
+            rows.append(row)
+        time.sleep(1)
+
+    return rows
+
+
 # ── 対象クラブ一覧 ──────────────────────────────────────────
 SALE_SOURCES = [
     {
@@ -585,8 +844,19 @@ SALE_SOURCES = [
         "expect_marker": "一般販売",
     },
     {
+        "club": "名古屋グランパス",
+        "url": "https://nagoya-grampus.jp/ticket/schedule/",
+        "parser": parse_grampus,
+        # 見出しが「一般<br>販売」で「一般販売」が連続した文字列にならないため、表タイトルを目印にする
+        "expect_marker": "チケット販売スケジュール",
+    },
+    {
         "club": "川崎フロンターレ",
         "collector": collect_frontale,
+    },
+    {
+        "club": "東京ヴェルディ",
+        "collector": collect_verdy,
     },
     # 清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
