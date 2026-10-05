@@ -68,10 +68,13 @@ def fetch(url: str) -> str | None:
         return None
 
 
-def fetch_with_playwright(url: str) -> str | None:
+def fetch_with_playwright(url: str, click_category: bool = False) -> str | None:
     """
     JavaScriptで後から内容が表示されるページ用に、実際のブラウザ(Chromium)で取得する。
     川崎フロンターレ(frontale.co.jp)専用。
+    click_category=True の場合のみ、「チケット」カテゴリーのリンクをクリックする
+    (記事ページ自体にも「チケット」という文字があり、誤ってクリックして
+    記事から離脱してしまうのを防ぐため、一覧ページ取得時だけに限定する)。
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -89,15 +92,16 @@ def fetch_with_playwright(url: str) -> str | None:
             page = context.new_page()
             page.goto(url, wait_until="networkidle", timeout=30000)
 
-            # 「チケット」カテゴリーのリンク/ボタンがあれば、実際にクリックして
-            # 一覧を絞り込む(URL直接アクセスだけでは反映されないサイト対策)
-            try:
-                category_link = page.get_by_text("チケット", exact=True).first
-                if category_link.count() > 0:
-                    category_link.click(timeout=5000)
-                    page.wait_for_timeout(3000)
-            except Exception:
-                pass
+            if click_category:
+                # 「チケット」カテゴリーのリンク/ボタンがあれば、実際にクリックして
+                # 一覧を絞り込む(URL直接アクセスだけでは反映されないサイト対策)
+                try:
+                    category_link = page.get_by_text("チケット", exact=True).first
+                    if category_link.count() > 0:
+                        category_link.click(timeout=5000)
+                        page.wait_for_timeout(3000)
+                except Exception:
+                    pass
 
             # 遅延読み込み(スクロールで初めて表示される)対策として、
             # 下までスクロールしてから少し待つ
@@ -479,7 +483,7 @@ def collect_frontale() -> list[dict]:
     list_html = None
     used_seed = None
     for seed in seed_urls:
-        list_html = fetch_with_playwright(seed)
+        list_html = fetch_with_playwright(seed, click_category=True)
         if list_html:
             used_seed = seed
             break
