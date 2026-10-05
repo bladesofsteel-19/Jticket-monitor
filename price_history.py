@@ -38,7 +38,9 @@ SALE_SHEET_NAME = "発売予定"
 HISTORY_FILES_SHEET_NAME = "履歴ファイル"
 VENUE_SHEET_NAME = "スタジアム略称"
 
-HEADER_FIRST = "記録日時"
+HEADER_FIRST = "記録日時"        # 旧形式(移行用)
+SALE_LABEL_PREFIX = "発売日："   # 新形式のA1セル
+HOLIDAY_SHEET_NAME = "祝日"      # 条件付き書式(日曜・祝日=赤)が参照する、非表示の祝日一覧
 NEW_SHEET_ROWS = 100
 NEW_SHEET_COLS = 30
 DEFAULT_SHEET_TITLES = {"シート1", "Sheet1"}
@@ -180,15 +182,37 @@ def sheet_sort_key(title: str):
 
 
 def seat_display(seat: dict) -> str:
-    """セルに入れる値。価格(変動制で幅があれば「最低～最高」)+ 完売なら「 完売」"""
+    """
+    セルに入れる値(メインのスプレッドシートと同じ表記)。
+      大人価格(一番高い価格)、変動価格なら「 [変動]」、完売なら「 完売」を付ける。
+      例: 「6,500」「4,800 [変動]」「3,600 完売」
+    """
     try:
-        pmin, pmax = int(seat["price_min"]), int(seat["price_max"])
-        price = f"{pmax:,}" if pmin == pmax else f"{pmin:,}～{pmax:,}"
+        price = f"{int(seat['price_max']):,}"
     except (KeyError, TypeError, ValueError):
         price = ""
+    if str(seat.get("dynamic")).lower() in ("true", "1"):
+        price += " [変動]"
     if seat.get("status") == "完売":
-        return f"{price} 完売".strip()
-    return price
+        price += " 完売"
+    return price.strip()
+
+
+def to_serial(d: date) -> int:
+    """日付をスプレッドシートの日付シリアル値に(1899/12/30 起点)"""
+    return (d - date(1899, 12, 30)).days
+
+
+def from_cell_date(v) -> int | None:
+    """A列の値(シリアル値、または旧形式の「2026-10-05 06:00」)をシリアル値に"""
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return int(v)
+    d = parse_full_date(str(v))
+    return to_serial(d) if d else None
+
+
+def sale_label(sale_day: date | None) -> str:
+    return f"{SALE_LABEL_PREFIX}{sale_day:%m/%d}" if sale_day else f"{SALE_LABEL_PREFIX}不明"
 
 
 def merge_columns(headers: list[str], page_order: list[str]) -> list[tuple[int, str]]:
@@ -221,50 +245,139 @@ def merge_columns(headers: list[str], page_order: list[str]) -> list[tuple[int, 
     return inserts
 
 
-def build_updated_table(values: list[list[str]], seats: list[dict], checked_at: str) -> list[list[str]] | None:
+def build_updated_table(values: list[list], seats: list[dict], today: date,
+                        label: str) -> tuple[list[list], bool] | tuple[None, bool]:
     """
-    シートの現在の内容(values)に今回の結果を反映した表を返す。
-    前回の行から変化が無ければ None(書き込み不要)。
+    シートの現在の内容(values: 書式なしの値)に今回の結果を反映した表を返す。
+    戻り値: (新しい表, 旧形式から移行したか)。前回の行から変化が無ければ (None, False)。
+    表の形:
+      1行目 = [「発売日：MM/DD」, 席種1, 席種2, ...]
+      2行目〜 = [日付(シリアル値), 価格, 価格, ...]
+    同じ日に2回実行された場合は、その日の行を上書きする(1日1行)。
     """
     page_order = []
     current_values = {}
-    for s in seats:
-        name = s["seat_type"]
+    for s_ in seats:
+        name = s_["seat_type"]
         if name not in current_values:
             page_order.append(name)
-        current_values[name] = seat_display(s)
+        current_values[name] = seat_display(s_)
 
-    if values and values[0] and values[0][0] == HEADER_FIRST:
-        header = list(values[0])
-        data = [list(r) for r in values[1:] if any(c.strip() for c in r)]
+    migrated = False
+    first = str(values[0][0]).strip() if values and values[0] else ""
+    if first == HEADER_FIRST or first.startswith(SALE_LABEL_PREFIX):
+        header = [str(c).strip() for c in values[0]]
+        raw_data = values[1:]
+        migrated = first == HEADER_FIRST
     else:
-        header = [HEADER_FIRST]
-        data = []
+        header = [""]
+        raw_data = []
 
     width = len(header)
-    data = [r + [""] * (width - len(r)) for r in data]
+    data = []
+    for r in raw_data:
+        r = list(r) + [""] * (width - len(r))
+        if not any(str(c).strip() for c in r):
+            continue
+        serial = from_cell_date(r[0])
+        cells = [str(c).strip() for c in r[1:width]]
+        if migrated:
+            # 旧形式の「6,800～7,800」は最高価格だけにする
+            cells = [c.split("～")[-1].strip() if "～" in c else c for c in cells]
+        data.append([serial if serial is not None else r[0]] + cells)
 
     seat_headers = header[1:]
     for pos, seat in merge_columns(seat_headers, page_order):
         seat_headers.insert(pos, seat)
         for r in data:
-            r.insert(pos + 1, "")  # A列(記録日時)のぶん+1
-    header = [HEADER_FIRST] + seat_headers
+            r.insert(pos + 1, "")  # A列のぶん+1
+    header = [label] + seat_headers
 
-    new_row = [checked_at] + [current_values.get(h, "") for h in seat_headers]
+    today_serial = to_serial(today)
+    new_row = [today_serial] + [current_values.get(h, "") for h in seat_headers]
 
-    if data:
+    if data and not migrated:
         last = data[-1]
         if last[1:] == new_row[1:]:
-            return None
+            if header == [str(c).strip() for c in values[0]]:
+                return None, False          # 変化なし
+            return [header] + data, False   # 価格は同じだが発売日の表示などが変わった
+        if last[0] == today_serial:
+            data[-1] = new_row               # 同じ日の2回目は上書き
+            return [header] + data, False
+    if data and migrated and data[-1][1:] == new_row[1:]:
+        return [header] + data, True
 
-    return [header] + data + [new_row]
+    return [header] + data + [new_row], migrated
+
+
+def hex_color(h: str) -> dict:
+    h = h.lstrip("#")
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
+
+
+def price_diff_formula(op: str) -> str:
+    """1つ上の行(前回の記録)との価格差で判定する式。[変動]・完売などの文字は除いて数値だけ比べる"""
+    cur = 'VALUE(SUBSTITUTE(REGEXEXTRACT(TO_TEXT(B3),"[0-9,]+"),",",""))'
+    prev = 'VALUE(SUBSTITUTE(REGEXEXTRACT(TO_TEXT(B2),"[0-9,]+"),",",""))'
+    return f"=IFERROR({op.format(d=f'({cur}-{prev})')},FALSE)"
+
+
+def formatting_requests(sheet_id: int) -> list[dict]:
+    """日付の表示形式・色分けと、価格の上下の色分けを設定するリクエスト(シート作成時・移行時に1回だけ)"""
+    date_range = {"sheetId": sheet_id, "startRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 1}  # A2:A
+    price_range = {"sheetId": sheet_id, "startRowIndex": 2, "startColumnIndex": 1}                   # B3:最後
+
+    def rule(rng, formula, text=None, bg=None, bold=False):
+        fmt = {}
+        if text:
+            fmt["textFormat"] = {"foregroundColor": hex_color(text), "bold": bold}
+        if bg:
+            fmt["backgroundColor"] = hex_color(bg)
+        return {"ranges": [rng], "booleanRule": {
+            "condition": {"type": "CUSTOM_FORMULA", "values": [{"userEnteredValue": formula}]},
+            "format": fmt}}
+
+    rules = [
+        # 日付: 日曜・祝日=赤、土曜=青(祝日の土曜は赤を優先)
+        rule(date_range, f'=AND($A2<>"",OR(WEEKDAY($A2)=1,COUNTIF(INDIRECT("{HOLIDAY_SHEET_NAME}!A:A"),$A2)>0))',
+             text="#CC0000"),
+        rule(date_range, '=AND($A2<>"",WEEKDAY($A2)=7)', text="#1155CC"),
+        # 価格: 前回より500円以上上がった=濃い赤、500円未満上がった=薄い赤、下がった場合は青
+        rule(price_range, price_diff_formula("{d}>=500"), text="#FFFFFF", bg="#C00000", bold=True),
+        rule(price_range, price_diff_formula("AND({d}>0,{d}<500)"), bg="#F4CCCC"),
+        rule(price_range, price_diff_formula("{d}<=-500"), text="#FFFFFF", bg="#1155CC", bold=True),
+        rule(price_range, price_diff_formula("AND({d}<0,{d}>-500)"), bg="#CFE2F3"),
+    ]
+    reqs = [{"repeatCell": {
+        "range": date_range,
+        "cell": {"userEnteredFormat": {"numberFormat": {"type": "DATE", "pattern": "MM/dd"}}},
+        "fields": "userEnteredFormat.numberFormat"}}]
+    reqs += [{"addConditionalFormatRule": {"rule": r, "index": i}} for i, r in enumerate(rules)]
+    return reqs
+
+
+def clear_conditional_formats_requests(sh, sheet_id: int) -> list[dict]:
+    """移行時に、既存の条件付き書式を消すリクエスト(重複して増えないように)"""
+    meta = retry_on_transient_error(sh.fetch_sheet_metadata)
+    for sheet in meta.get("sheets", []):
+        if sheet["properties"]["sheetId"] == sheet_id:
+            n = len(sheet.get("conditionalFormats", []))
+            return [{"deleteConditionalFormatRule": {"sheetId": sheet_id, "index": 0}} for _ in range(n)]
+    return []
+
+
+def read_unformatted(ws) -> list[list]:
+    """日付をシリアル値のまま読む(表示形式「MM/dd」だと年が失われるため)"""
+    from gspread.utils import rowcol_to_a1
+    rng = f"A1:{rowcol_to_a1(ws.row_count, ws.col_count)}"
+    return retry_on_transient_error(ws.get, rng, value_render_option="UNFORMATTED_VALUE") or []
 
 
 def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
-                      seats: list[dict], checked_at: str) -> tuple[bool, bool]:
+                      seats: list[dict], today: date, label: str) -> tuple[bool, bool]:
     """
-    1試合分を書き込む。戻り値: (シートを新規作成したか, 行を追記したか)
+    1試合分を書き込む。戻り値: (シートを新規作成したか, 行を追記・更新したか)
     既存シートはシート名の先頭(「MMDD 相手」)で探すので、後から会場名が変わっても同じシートに書く。
     """
     ws = None
@@ -280,9 +393,9 @@ def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
         created = True
         values = []
     else:
-        values = retry_on_transient_error(ws.get_all_values)
+        values = read_unformatted(ws)
 
-    table = build_updated_table(values, seats, checked_at)
+    table, migrated = build_updated_table(values, seats, today, label)
     if table is None:
         return created, False
 
@@ -293,19 +406,58 @@ def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
             rows=max(ws.row_count, need_rows + 50),
             cols=max(ws.col_count, need_cols + 5),
         )
+    if migrated:
+        retry_on_transient_error(ws.clear)
+    # RAW で書くので、日付(数値)は日付のまま、価格(文字列)は「6,500」の表記のまま入る
     retry_on_transient_error(ws.update, values=table, range_name="A1")
+
+    if created or migrated:
+        reqs = []
+        if migrated:
+            reqs += clear_conditional_formats_requests(sh, ws.id)
+        reqs += formatting_requests(ws.id)
+        retry_on_transient_error(sh.batch_update, {"requests": reqs})
     return created, True
 
 
-def tidy_spreadsheet(sh):
-    """試合シートを日付順に並べ、空の初期シート(「シート1」)を消す"""
+def japanese_holidays(years: list[int]) -> list[date]:
+    try:
+        import jpholiday
+    except ImportError:
+        print("[WARN] jpholiday が未インストールのため、祝日の色分けは行いません(土日のみ)")
+        return []
+    days = []
+    for y in years:
+        days += [d for d, _name in jpholiday.year_holidays(y)]
+    return sorted(days)
+
+
+def ensure_holiday_sheet(sh, holidays: list[date]):
+    """条件付き書式が参照する非表示の「祝日」シートを用意する(中身は毎回最新にする)"""
+    import gspread
+    try:
+        ws = retry_on_transient_error(sh.worksheet, HOLIDAY_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = retry_on_transient_error(sh.add_worksheet, title=HOLIDAY_SHEET_NAME, rows=100, cols=2)
+        retry_on_transient_error(sh.batch_update, {"requests": [{"updateSheetProperties": {
+            "properties": {"sheetId": ws.id, "hidden": True}, "fields": "hidden"}}]})
+    rows = [[to_serial(d)] for d in holidays] or [[""]]
+    if len(rows) > ws.row_count:
+        retry_on_transient_error(ws.resize, rows=len(rows) + 10, cols=2)
+    retry_on_transient_error(ws.clear)
+    retry_on_transient_error(ws.update, values=rows, range_name="A1")
+
+
+def tidy_spreadsheet(sh, holidays: list[date]):
+    """祝日シートの更新、試合シートの日付順の並べ替え、空の初期シート(「シート1」)の削除"""
+    ensure_holiday_sheet(sh, holidays)
     all_ws = retry_on_transient_error(sh.worksheets)
     match_ws = [w for w in all_ws if sheet_sort_key(w.title)[0] == 1]
     if match_ws:
         for w in all_ws:
             if w.title in DEFAULT_SHEET_TITLES:
                 vals = retry_on_transient_error(w.get_all_values)
-                if not any(any(c.strip() for c in r) for r in vals):
+                if not any(any(str(c).strip() for c in r) for r in vals):
                     retry_on_transient_error(sh.del_worksheet, w)
         all_ws = retry_on_transient_error(sh.worksheets)
     ordered = sorted(all_ws, key=lambda w: sheet_sort_key(w.title))
@@ -362,11 +514,10 @@ def record_price_history(all_rows: list[dict], abbr_map: dict | None = None):
         # 記録期間: 一般発売日〜試合日(発売予定シートに行が無い試合は、試合日までずっと記録する)
         if today > match_day:
             continue
-        if sale:
-            sale_day = parse_md_near(sale.get("general_sale", ""), match_day)
-            if sale_day and today < sale_day:
-                skipped += 1
-                continue
+        sale_day = parse_md_near(sale.get("general_sale", ""), match_day) if sale else None
+        if sale_day and today < sale_day:
+            skipped += 1
+            continue
 
         opponent = sale.get("opponent") if sale else away
         opp_short = short_club(opponent, abbr_map or {})
@@ -395,7 +546,7 @@ def record_price_history(all_rows: list[dict], abbr_map: dict | None = None):
                 opened[url] = (book, {w.title: w for w in ws_list})
             book, name_to_ws = opened[url]
             created, appended = write_match_sheet(
-                book, name_to_ws, prefix, title, seats, head.get("checked_at", "")
+                book, name_to_ws, prefix, title, seats, today, sale_label(sale_day)
             )
             if created or appended:
                 touched_files.add(url)
@@ -406,9 +557,10 @@ def record_price_history(all_rows: list[dict], abbr_map: dict | None = None):
             print(f"[WARN] 価格履歴: {home} {title} の書き込みに失敗しました ({type(e).__name__}: {e})")
         time.sleep(1.2)  # 1分あたりの読み書き回数の上限に当たらないよう間隔を空ける
 
+    holidays = japanese_holidays([today.year - 1, today.year, today.year + 1]) if touched_files else []
     for url in touched_files:
         try:
-            tidy_spreadsheet(opened[url][0])
+            tidy_spreadsheet(opened[url][0], holidays)
         except Exception as e:
             print(f"[WARN] 価格履歴: シートの並び替えに失敗しました ({e})")
 
