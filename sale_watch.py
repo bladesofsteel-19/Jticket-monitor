@@ -173,7 +173,7 @@ def parse_zelvia(html: str) -> list[dict]:
             "match_date": f"{int(m.group('month'))}/{int(m.group('day'))}",
             "opponent": dedupe_name(m.group("opponent")),
             "venue": m.group("venue").strip(),
-            "general_sale": m.group("general").strip(),
+            "general_sale": format_sale_datetime(m.group("general")),
         })
     return rows
 
@@ -226,8 +226,8 @@ def parse_marinos(html: str) -> list[dict]:
             "section": match_cell.strip(),
             "match_date": match_date_m.group(1),
             "opponent": opponent_m.group(1).strip(),
-            "venue": "",
-            "general_sale": general_sale.strip(),
+            "venue": re.sub(r"\s+", "", (re.search(r"\[([^\]]+)\]", opponent_cell) or [None, ""])[1]),
+            "general_sale": format_sale_datetime(general_sale),
         })
     return rows
 
@@ -379,7 +379,7 @@ def parse_gamba(html: str) -> list[dict]:
         # 日付候補は複数ある(FC先行販売の日付も同じ形式のため)。
         # 「日付(曜)→時刻→＠スタジアム」の並びが直後に続くものだけを、本当の試合日として扱う。
         date_m = re.search(
-            r"(\d{1,2})\.(\d{1,2})\s*\([^)]*\)\s*\n\s*[\d:]+\s*\n\s*＠",
+            r"(\d{1,2})\.(\d{1,2})\s*\([^)]*\)\s*\n\s*[\d:]+\s*\n\s*＠\s*([^\n]+)",
             block,
         )
 
@@ -396,8 +396,8 @@ def parse_gamba(html: str) -> list[dict]:
             "section": section,
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
             "opponent": dedupe_name(opponent_m.group(1)),
-            "venue": "",
-            "general_sale": general_m.group(1).strip(),
+            "venue": date_m.group(3).strip(),  # 「＠パナスタ」の部分
+            "general_sale": format_sale_datetime(general_m.group(1)),
         })
     return rows
 
@@ -438,7 +438,7 @@ def parse_cerezo(html: str) -> list[dict]:
             "section": f"第{section}節",
             "match_date": f"{int(m.group(1))}/{int(m.group(2))}",
             "opponent": dedupe_name(m.group(4)),
-            "venue": "",
+            "venue": (re.search(r"会場\s*[:：]\s*([^\n]+)", body[:400]) or [None, ""])[1].strip(),
             "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
     return rows
@@ -475,7 +475,7 @@ def parse_avispa(html: str) -> list[dict]:
             "section": extract_section(chunk[:200]),
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
             "opponent": opponent,
-            "venue": "",
+            "venue": chunk.strip().splitlines()[0].strip() if chunk.strip() else "",  # 「HOME ベスト電器スタジアム」
             "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
     return rows
@@ -515,7 +515,8 @@ def parse_urawa(html: str) -> list[dict]:
             "section": extract_section(cells[1]),  # 「大会・節」列
             "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
             "opponent": dedupe_name(opponent_cell),
-            "venue": "",
+            # 「10/21(水) 19:30キックオフ 埼玉スタジアム2002」の「キックオフ」以降
+            "venue": (re.search(r"キックオフ\s*(.+)$", nfkc(match_cell)) or [None, ""])[1].strip(),
             "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
         })
     return rows
@@ -605,6 +606,26 @@ def collect_frontale() -> list[dict]:
 def nfkc(s) -> str:
     """全角数字・全角括弧・全角コロン等を半角に揃える(「10：00」→「10:00」など)"""
     return unicodedata.normalize("NFKC", str(s)).strip()
+
+
+FREE_SALE_DT_RE = re.compile(
+    r"(\d{1,2})(?:/|\.|月)(\d{1,2})日?\s*(?:\([^)]*\))?\s*(?:(\d{1,2}):(\d{2}))?"
+)
+
+
+def format_sale_datetime(raw: str) -> str:
+    """
+    クラブごとにバラバラな発売日時の書き方を、他クラブと同じ「M/D H:MM」に揃える。
+      「7月24日（金）12:00」(町田) → 「7/24 12:00」
+      「9.19(土)10:00 ～」(ガンバ) → 「9/19 10:00」
+    日付が読み取れなければ元の文字列をそのまま返す(情報を落とさないため)。
+    """
+    t = nfkc(raw)
+    m = FREE_SALE_DT_RE.search(t)
+    if not m:
+        return raw.strip()
+    md = f"{int(m.group(1))}/{int(m.group(2))}"
+    return f"{md} {int(m.group(3))}:{m.group(4)}" if m.group(3) else md
 
 
 def extract_section(text: str) -> str:
@@ -850,32 +871,6 @@ def parse_verdy_article(html: str) -> list[dict]:
     return rows
 
 
-# 販売記事の表に「節」列が無い場合の補完用。Football LAB(データスタジアム運営)の日程表を使う。
-# year はシーズン開始年(2026/27シーズン → 2026)
-VERDY_FIXTURE_URL = "https://www.football-lab.jp/tk-v/match?year={year}"
-
-
-def fetch_verdy_section_lookup() -> dict[str, str]:
-    """J1の日程表から {"11/21": "第15節", ...} の対応表を作る。取得できなければ空の辞書"""
-    today = datetime.now(JST).date()
-    season_year = today.year if today.month >= 7 else today.year - 1
-    html = fetch(VERDY_FIXTURE_URL.format(year=season_year))
-    if not html:
-        return {}
-
-    # pd.read_html だと「10.10」が数値の10.1になってしまうため、セルを文字列のまま読む
-    soup = BeautifulSoup(html, "html.parser")
-    lookup = {}
-    for tr in soup.find_all("tr"):
-        cells = [nfkc(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
-        if len(cells) < 2 or not re.fullmatch(r"\d+", cells[0]):
-            continue
-        dm = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", cells[1])
-        if dm:
-            lookup[f"{int(dm.group(1))}/{int(dm.group(2))}"] = f"第{int(cells[0])}節"
-    return lookup
-
-
 def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
     """
     verdy.co.jp は販売日程ページの表がJSで後から読み込まれるため、
@@ -939,15 +934,6 @@ def collect_verdy(max_pages: int = 3, max_articles: int = 8) -> list[dict]:
             seen.add(key)
             rows.append(row)
         time.sleep(1)
-
-    # 記事の表に「節」列が無かった試合は、日程表から節を補う(J1以外の試合は日付が一致しないので空のまま)
-    if any(not r["section"] for r in rows):
-        lookup = fetch_verdy_section_lookup()
-        if DEBUG_TEXT_DUMP:
-            print(f"[DEBUG] 東京ヴェルディ: 節の対応表 {len(lookup)}件")
-        for r in rows:
-            if not r["section"]:
-                r["section"] = lookup.get(r["match_date"], "")
 
     return rows
 
@@ -1088,6 +1074,84 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
     return html  # 最終的に目印が無くても、最後に取得できた内容をそのまま返す(呼び出し側で0件になるだけ)
 
 
+# ── 会場名・節の補完 ─────────────────────────────────────────
+# 販売ページに会場(や節)が載っていないクラブは、Football LAB(データスタジアム運営)の
+# J1日程表から、試合日をキーに補う。カップ戦・ACLは載っていないので空欄のまま。
+FOOTBALL_LAB_CODES = {
+    "東京ヴェルディ": "tk-v",
+    "京都サンガF.C.": "kyot",
+    "川崎フロンターレ": "ka-f",
+}
+FOOTBALL_LAB_URL = "https://www.football-lab.jp/{code}/match?year={year}"
+
+# 略称で書かれている会場名を正式名称に揃える(載っていない略称はそのまま表示される)
+VENUE_FULL_NAMES = {
+    "味スタ": "味の素スタジアム",
+    "MUFG国立": "MUFGスタジアム(国立競技場)",
+    "U等々力": "Uvanceとどろきスタジアム by Fujitsu",
+    "サンガS": "サンガスタジアム by KYOCERA",
+    "パナスタ": "パナソニックスタジアム吹田",
+    "吹田S": "市立吹田サッカースタジアム",
+}
+
+
+def fetch_footballlab_lookup(code: str) -> dict[str, dict]:
+    """{"11/21": {"section": "第15節", "venue": "味スタ"}, ...} を返す。取得できなければ空の辞書"""
+    today = datetime.now(JST).date()
+    season_year = today.year if today.month >= 7 else today.year - 1  # 2026/27シーズン → 2026
+    html = fetch(FOOTBALL_LAB_URL.format(code=code, year=season_year))
+    if not html:
+        return {}
+
+    # pd.read_html だと「10.10」が数値の10.1になってしまうため、セルを文字列のまま読む
+    soup = BeautifulSoup(html, "html.parser")
+    lookup = {}
+    for tr in soup.find_all("tr"):
+        cells = [nfkc(td.get_text(" ", strip=True)) for td in tr.find_all(["td", "th"])]
+        if len(cells) < 4 or not re.fullmatch(r"\d+", cells[0]):
+            continue
+        dm = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", cells[1])
+        if not dm:
+            continue
+        # 列: 節 / 開催日 / (曜) / 相手 / [スコア(試合後のみ)] / H or A / 会場 / ...
+        venue = ""
+        for i in range(3, len(cells) - 1):
+            if cells[i] in ("H", "A"):
+                venue = cells[i + 1]
+                break
+        lookup[f"{int(dm.group(1))}/{int(dm.group(2))}"] = {
+            "section": f"第{int(cells[0])}節",
+            "venue": venue,
+        }
+    return lookup
+
+
+def fill_missing_from_footballlab(rows: list[dict]) -> None:
+    """会場・節が空欄の行を Football LAB の日程表で補う(該当クラブのみ、1クラブ1回だけ取得)"""
+    cache: dict[str, dict] = {}
+    for r in rows:
+        code = FOOTBALL_LAB_CODES.get(r["club"])
+        if not code or (r.get("venue") and r.get("section")):
+            continue
+        if code not in cache:
+            cache[code] = fetch_footballlab_lookup(code)
+            if DEBUG_TEXT_DUMP:
+                print(f"[DEBUG] {r['club']}: Football LAB の日程 {len(cache[code])}件")
+        info = cache[code].get(r["match_date"])
+        if not info:
+            continue  # カップ戦など、J1日程に無い試合
+        if not r.get("section"):
+            r["section"] = info["section"]
+        if not r.get("venue"):
+            r["venue"] = info["venue"]
+
+
+def normalize_venues(rows: list[dict]) -> None:
+    for r in rows:
+        v = nfkc(r.get("venue", "")) if r.get("venue") else ""
+        r["venue"] = VENUE_FULL_NAMES.get(v, v)
+
+
 def collect_all() -> list[dict]:
     all_rows = []
     for source in SALE_SOURCES:
@@ -1096,6 +1160,12 @@ def collect_all() -> list[dict]:
             all_rows.extend(collect_one(source))
         except Exception as e:
             print(f"[WARN] {source['club']}: 取得中にエラーが発生したためスキップします ({type(e).__name__}: {e})")
+
+    try:
+        fill_missing_from_footballlab(all_rows)
+    except Exception as e:
+        print(f"[WARN] 会場・節の補完に失敗しました ({type(e).__name__}: {e})")
+    normalize_venues(all_rows)
     return all_rows
 
 
