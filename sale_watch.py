@@ -337,6 +337,42 @@ def parse_cerezo(html: str) -> list[dict]:
     return rows
 
 
+# ── アビスパ福岡 ──────────────────────────────────────────
+def parse_avispa(html: str) -> list[dict]:
+    """
+    avispa.co.jp/match/series/2026-27 を解析する。
+    試合一覧(ホーム/アウェイ混在)から「HOME」のブロックだけを対象にする。
+    一般発売日は「一般 M.D[曜]HH:MM〜」という形式(ピリオド区切り)。
+    """
+    text = text_with_img_alts(html)
+
+    blocks = re.split(r"\n(HOME|AWAY)\s", text)
+    rows = []
+    for i in range(1, len(blocks), 2):
+        if blocks[i] != "HOME":
+            continue
+        chunk = blocks[i + 1] if i + 1 < len(blocks) else ""
+
+        date_m = re.search(r"(\d{1,2})/(\d{1,2})", chunk[:200])
+        opponent = find_opponent_name(chunk[:300])
+        general_m = re.search(
+            r"一般\s*(\d{1,2})\.(\d{1,2})\[[^\]]*\]\s*(\d{1,2}:\d{2})", chunk
+        )
+
+        if not (date_m and opponent and general_m):
+            continue  # 発売日未定の試合はスキップ
+
+        rows.append({
+            "club": "アビスパ福岡",
+            "section": "",
+            "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
+            "opponent": opponent,
+            "venue": "",
+            "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
+        })
+    return rows
+
+
 # ── 対象クラブ一覧 ──────────────────────────────────────────
 SALE_SOURCES = [
     {
@@ -362,6 +398,12 @@ SALE_SOURCES = [
         "url": "https://www.cerezo.jp/ticket/",
         "parser": parse_cerezo,
         "expect_marker": "一般販売",
+    },
+    {
+        "club": "アビスパ福岡",
+        "url": "https://www.avispa.co.jp/match/series/2026-27",
+        "parser": parse_avispa,
+        "expect_marker": "一般",
     },
     # 清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
