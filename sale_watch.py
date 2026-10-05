@@ -420,7 +420,7 @@ def parse_urawa(html: str) -> list[dict]:
 
 
 # ── 川崎フロンターレ ──────────────────────────────────────────
-TICKET_TITLE_RE = re.compile(r"^\d{1,2}/\d{1,2}\s*\S+?「チケット販売」のお知らせ$")
+TICKET_TITLE_PHRASE = "「チケット販売」のお知らせ"
 
 
 def collect_frontale() -> list[dict]:
@@ -454,7 +454,7 @@ def collect_frontale() -> list[dict]:
         title = a.get_text(strip=True)
         if title and len(all_titles_sample) < 20:
             all_titles_sample.append(title)
-        if TICKET_TITLE_RE.match(title):
+        if TICKET_TITLE_PHRASE in title:
             href = a["href"]
             full_url = href if href.startswith("http") else f"https://www.frontale.co.jp{href}"
             if full_url not in links:
