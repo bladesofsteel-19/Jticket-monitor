@@ -502,8 +502,17 @@ def collect_all() -> list[dict]:
             continue
 
         if DEBUG_TEXT_DUMP:
-            sample = text_with_img_alts(html)[:1500]
-            print(f"[DEBUG] ---- {source['club']} の実際のテキスト(先頭1500文字) ----")
+            full_text = text_with_img_alts(html)
+            marker = source.get("expect_marker")
+            idx = full_text.find(marker) if marker else -1
+            if idx != -1:
+                start = max(0, idx - 400)
+                sample = full_text[start: start + 1800]
+                label = f"「{marker}」の周辺"
+            else:
+                sample = full_text[:1500]
+                label = "先頭1500文字(目印が見つからなかったため)"
+            print(f"[DEBUG] ---- {source['club']} の実際のテキスト({label}) ----")
             print(repr(sample))
             print("[DEBUG] ---- ここまで ----")
 
