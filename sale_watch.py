@@ -263,6 +263,80 @@ def parse_sanga(html: str) -> list[dict]:
     return rows
 
 
+# ── ガンバ大阪 ──────────────────────────────────────────
+def parse_gamba(html: str) -> list[dict]:
+    """
+    gamba-osaka.net/ticket/schedule/ を解析する。
+    「HOME」を区切りにブロック化し、各ブロック内の日付・対戦相手(vs. 〜)・
+    一般販売の行から情報を取得する。一般販売が「未定」の試合はスキップする。
+    """
+    text = text_with_img_alts(html)
+
+    blocks = text.split("HOME")[1:]
+    rows = []
+    for block in blocks:
+        date_m = re.search(r"(\d{1,2})\.(\d{1,2})\(", block)
+        opponent_m = re.search(r"vs\.\s*([^\n]+)", block)
+        if not (date_m and opponent_m):
+            continue
+
+        general_m = re.search(r"一般販売\s*\n\s*([^\n未]+)", block)
+        if not general_m:
+            continue  # 「未定」等、まだ発売日未定の試合はスキップ
+
+        rows.append({
+            "club": "ガンバ大阪",
+            "section": "",
+            "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
+            "opponent": dedupe_name(opponent_m.group(1)),
+            "venue": "",
+            "general_sale": general_m.group(1).strip(),
+        })
+    return rows
+
+
+# ── セレッソ大阪 ──────────────────────────────────────────
+def parse_cerezo(html: str) -> list[dict]:
+    """
+    cerezo.jp/ticket/ の「販売スケジュール」部分(表の下にあるテキスト形式の
+    繰り返しブロック)を解析する。
+    ブロック形式: 第N節 M/D（曜）HH:MM vs 相手 / 会場：... / 一般販売 ・企画チケット販売 / 日付
+    """
+    text = text_with_img_alts(html)
+
+    blocks = re.split(r"第(\d+)節\s+", text)
+    rows = []
+    for i in range(1, len(blocks), 2):
+        section = blocks[i]
+        body = blocks[i + 1] if i + 1 < len(blocks) else ""
+        head = body[:120]
+
+        m = re.match(
+            r"(\d{1,2})/(\d{1,2})（[^）]+）\s*(\d{1,2}:\d{2})\s*vs\s*(\S+)",
+            head,
+        )
+        if not m:
+            continue
+
+        gm_idx = body.rfind("一般販売")
+        if gm_idx == -1:
+            continue
+        window = body[gm_idx: gm_idx + 100]
+        general_m = re.search(r"(\d{1,2})/(\d{1,2})\([^)]*\)\s*([\d:]+)", window)
+        if not general_m:
+            continue
+
+        rows.append({
+            "club": "セレッソ大阪",
+            "section": f"第{section}節",
+            "match_date": f"{int(m.group(1))}/{int(m.group(2))}",
+            "opponent": dedupe_name(m.group(4)),
+            "venue": "",
+            "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
+        })
+    return rows
+
+
 # ── 対象クラブ一覧 ──────────────────────────────────────────
 SALE_SOURCES = [
     {
@@ -275,6 +349,18 @@ SALE_SOURCES = [
         "club": "横浜F・マリノス",
         "url": "https://www.f-marinos.com/ticket/schedule",
         "parser": parse_marinos,
+        "expect_marker": "一般販売",
+    },
+    {
+        "club": "ガンバ大阪",
+        "url": "https://www.gamba-osaka.net/ticket/schedule/",
+        "parser": parse_gamba,
+        "expect_marker": "一般販売",
+    },
+    {
+        "club": "セレッソ大阪",
+        "url": "https://www.cerezo.jp/ticket/",
+        "parser": parse_cerezo,
         "expect_marker": "一般販売",
     },
     # 清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
