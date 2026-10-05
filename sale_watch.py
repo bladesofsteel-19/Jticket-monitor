@@ -275,7 +275,13 @@ def parse_gamba(html: str) -> list[dict]:
     blocks = text.split("HOME")[1:]
     rows = []
     for block in blocks:
-        date_m = re.search(r"(\d{1,2})\.(\d{1,2})\(", block)
+        # 日付候補は複数ある(FC先行販売の日付も同じ形式のため)。
+        # 「日付(曜)→時刻→＠スタジアム」の並びが直後に続くものだけを、本当の試合日として扱う。
+        date_m = re.search(
+            r"(\d{1,2})\.(\d{1,2})\([^)]*\)\s*\n\s*[\d:]+\s*\n\s*＠",
+            block,
+        )
+
         opponent_m = re.search(r"vs\.\s*([^\n]+)", block)
         if not (date_m and opponent_m):
             continue
@@ -373,6 +379,46 @@ def parse_avispa(html: str) -> list[dict]:
     return rows
 
 
+# ── 浦和レッズ ──────────────────────────────────────────
+def parse_urawa(html: str) -> list[dict]:
+    """
+    urawa-reds.co.jp/ticket/saleperiod.html のHTML表を解析する。
+    列: 試合日時・会場 / 大会・節 / 対戦相手 / シーズンチケット / 各種先行販売 / 一般販売 / リンク
+    """
+    try:
+        tables = pd.read_html(io.StringIO(html))
+    except ValueError:
+        return []
+    if not tables:
+        return []
+
+    df = tables[0]
+    rows = []
+    for _, row in df.iterrows():
+        cells = [str(c).strip() for c in row.tolist()]
+        if len(cells) < 6 or cells[0].lower() == "nan":
+            continue
+
+        match_cell = cells[0]
+        opponent_cell = cells[2]
+        general_cell = cells[5]
+
+        date_m = re.search(r"(\d{1,2})/(\d{1,2})", match_cell)
+        general_m = re.search(r"(\d{1,2})/(\d{1,2})\([^)]*\)\s*([\d:]+)", general_cell)
+        if not (date_m and general_m and opponent_cell):
+            continue
+
+        rows.append({
+            "club": "浦和レッズ",
+            "section": "",
+            "match_date": f"{int(date_m.group(1))}/{int(date_m.group(2))}",
+            "opponent": dedupe_name(opponent_cell),
+            "venue": "",
+            "general_sale": f"{int(general_m.group(1))}/{int(general_m.group(2))} {general_m.group(3)}",
+        })
+    return rows
+
+
 # ── 対象クラブ一覧 ──────────────────────────────────────────
 SALE_SOURCES = [
     {
@@ -404,6 +450,12 @@ SALE_SOURCES = [
         "url": "https://www.avispa.co.jp/match/series/2026-27",
         "parser": parse_avispa,
         "expect_marker": "一般",
+    },
+    {
+        "club": "浦和レッズ",
+        "url": "https://www.urawa-reds.co.jp/ticket/saleperiod.html",
+        "parser": parse_urawa,
+        "expect_marker": "一般販売",
     },
     # 清水エスパルス・京都サンガF.C.は、サイト側のボット対策により
     # GitHub Actionsからの取得が(Playwrightを使っても)できなかったため、
