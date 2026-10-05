@@ -528,6 +528,11 @@ def build_pivots(df: pd.DataFrame, abbr_map: dict | None = None) -> dict[str, pd
 
     pivots = {}
     for perform_id, group in groups:
+              # 同じ日に複数回取得した場合は、その日の最後の取得結果だけを使う(同日は上書き)
+        group = group.copy()
+        group["check_date"] = group["checked_at"].astype(str).str[:10]
+        latest = group.groupby("check_date")["checked_at"].transform("max")
+        group = group[group["checked_at"] == latest]
         raw_card = str(group["raw_card"].iloc[0]) if "raw_card" in group.columns else ""
         card = abbreviate_text(raw_card, abbr_map).replace("対", "-")
 
