@@ -401,14 +401,19 @@ def extract_seat_blocks_structured(html: str) -> list[dict]:
         except (TypeError, ValueError):
             order = 9999
 
-        items = dd.select("li")
-        if not items:
-            continue
-        for li in items:
+        items = []
+        for li in dd.select("li"):
             h5 = li.find("h5")
             label = h5.get_text(strip=True) if h5 else name
             area = label[len(name):] if label.startswith(name) else ""
-            area = area.strip(" 　").rstrip("．.")
+            items.append((li, area.strip(" 　").rstrip("．.")))
+        if not items:
+            continue
+        # 区画名つきの項目がある席種では、区画名の無い項目(マークの無い、区画を選ばない購入枠)は除く。
+        # この枠は常に「×」扱いで出てくるため、残すと実際には空席があるのに完売の列が増えてしまう。
+        if any(area for _, area in items):
+            items = [(li, area) for li, area in items if area]
+        for li, area in items:
             cls = li.get("class") or []
             if "no" in cls:
                 status = "完売"
