@@ -14,7 +14,7 @@
 - 1試合=1シート。シート名は「MMDD 相手略称_スタジアム略称」(例: 1021 C大阪_豊田ス)。
 - 1行目は見出し(A列「記録日時」、B列以降が席種)。席種の列はチケットサイトの表示順で並べ、
   途中で増えた席種は、サイト上で1つ前にある席種の右隣に列を挿入する。既存の列は動かさない。
-- 前回の記録から価格か販売状況が変わったときだけ1行追記する(容量節約と、変化の時点を見やすくするため)。
+- 取得するたびに1日1行追記する(価格が前日と同じでも記録する)。同じ日に2回以上実行した場合は、その日の行を上書きする。
 
 【メインのスプレッドシートに必要なシート】
 - 発売予定     : sale_watch.py が書き出す(club / match_date / opponent / venue / general_sale 列を使う)
@@ -295,7 +295,8 @@ def build_updated_table(values: list[list], seats: list[dict], today: date, labe
     """
     シートの現在の内容(values: 画面に表示されている値)に今回の結果を反映した表を返す。
     価格は表示の文字列(「4,000 [変動]」)のまま比べ、書き込むときに数値+表示形式に変換する。
-    戻り値: (新しい表, 旧形式から移行したか)。前回の行から変化が無ければ (None, False)。
+    戻り値: (新しい表, 旧形式から移行したか)。書き込みが不要なら (None, False)。
+    価格が前日と同じでも、毎日1行追加する。同じ日に2回以上実行した場合は、その日の行を上書きする。
     表の形:
       1行目 = [「発売日：MM/DD」, 席種1, 席種2, ...]
       2行目〜 = [日付(シリアル値), 価格, 価格, ...]
@@ -342,17 +343,13 @@ def build_updated_table(values: list[list], seats: list[dict], today: date, labe
     today_serial = to_serial(today)
     new_row = [today_serial] + [current_values.get(h, "") for h in seat_headers]
 
-    if data and not migrated:
-        last = data[-1]
-        if last[1:] == new_row[1:]:
-            if header == [str(c).strip() for c in values[0]]:
-                return None, False          # 変化なし
-            return [header] + data, False   # 価格は同じだが発売日の表示などが変わった
-        if last[0] == today_serial:
-            data[-1] = new_row               # 同じ日の2回目は上書き
-            return [header] + data, False
-    if data and migrated and data[-1][1:] == new_row[1:]:
-        return [header] + data, True
+    if data and data[-1][0] == today_serial:
+        # 同じ日の2回目以降は、その日の行を上書きする
+        if (not migrated and data[-1][1:] == new_row[1:]
+                and header == [str(c).strip() for c in values[0]]):
+            return None, False  # 同じ日・同じ内容なら書き込み不要
+        data[-1] = new_row
+        return [header] + data, migrated
 
     return [header] + data + [new_row], migrated
 
