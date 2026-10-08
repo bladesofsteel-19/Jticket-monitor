@@ -10,9 +10,9 @@ CSVに履歴として記録するスクリプト。
   そのため、まずは「対象試合のURLを直接指定する」運用を基本にしています。
   (例: https://www.jleague-ticket.jp/sales/perform/2626898/001)
 - 個別試合ページ (/sales/perform/xxxxxxx/001) は通常のHTTPリクエストで取得できることを確認済みです。
-- 完売判定は「選択する」リンクが表示されているかどうかで行っています。
-  実際の完売中の試合ページ(2625117番)で、完売中の席種には「選択する」が
-  表示されないことを確認済みです。
+- 完売判定は、席種の区画ごとの販売状況マーク(◯=vacant / △=few / ×=no)で行っています。
+  ×のときだけ「完売」とします。ページの作りが変わって読めない場合は、
+  旧方式(「選択する」リンクの有無)で判定します。
 """
 
 import csv
@@ -352,9 +352,84 @@ def extract_match_meta(html: str, url: str) -> dict:
     }
 
 
+# 全角数字(席種名の「カウンターシート２」など)を価格に巻き込まないよう、半角数字だけを対象にする
+PRICE_IN_TEXT_RE = re.compile(r"([0-9,]+)円\s*(?:[~〜～]\s*([0-9,]+)円)?\s*/\s*枚")
+
+
 def extract_seat_blocks(html: str) -> list[dict]:
     """
-    ページ全体のテキストから席種ブロックを抽出する。
+    席種ごとの価格・販売状況を取得する。
+    試合ページの席種一覧(<dl>ごとに1席種)をHTMLの構造で読み、
+    読めなかった場合だけ旧方式(テキストを行ごとに読む方式)に切り替える。
+    """
+    seats = extract_seat_blocks_structured(html)
+    return seats if seats else extract_seat_blocks_text(html)
+
+
+def extract_seat_blocks_structured(html: str) -> list[dict]:
+    """
+    席種一覧の構造:
+      <dl>
+        <dt data-mark-no="7"> … <h4>席種名</h4> <p>基本価格：2200円～5600円/枚</p> … </dt>
+        <dd> … <li class="vacant|few|no"> <h5>席種名　区画名</h5> [選択する] </li> … </dd>
+      </dl>
+    販売状況は区画ごとの <li> の class で判定する(vacant=◯、few=△、no=×)。
+    ×(no)だけを「完売」とし、◯と△は「販売中」とする。
+    (以前の方式は、「選択する」が区画名と別の行にあるページで全区画を完売と誤判定していた)
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    seats = []
+    for dl in soup.select("dl"):
+        if "resale-link" in (dl.get("class") or []):
+            continue
+        dt, dd = dl.find("dt"), dl.find("dd")
+        h4 = dt.find("h4") if dt else None
+        if not (dt and dd and h4):
+            continue
+        name = h4.get_text(strip=True)
+        dt_text = dt.get_text(" ", strip=True)
+        # 価格は席種名(h4)の下の <p> に書かれている(「基本価格：」と金額が別の<span>のこともある)
+        price_text = "".join(p.get_text("", strip=True) for p in dt.find_all("p"))
+        pm = PRICE_IN_TEXT_RE.search(price_text)
+        if not name or not pm:
+            continue
+        price_min = pm.group(1).replace(",", "")
+        price_max = (pm.group(2) or pm.group(1)).replace(",", "")
+        is_dynamic = "変動" in dt_text
+        try:
+            order = int(dt.get("data-mark-no"))
+        except (TypeError, ValueError):
+            order = 9999
+
+        items = dd.select("li")
+        if not items:
+            continue
+        for li in items:
+            h5 = li.find("h5")
+            label = h5.get_text(strip=True) if h5 else name
+            area = label[len(name):] if label.startswith(name) else ""
+            area = area.strip(" 　").rstrip("．.")
+            cls = li.get("class") or []
+            if "no" in cls:
+                status = "完売"
+            elif "vacant" in cls or "few" in cls:
+                status = "販売中"
+            else:
+                status = "販売中" if SELECT_LINK_TEXT in li.get_text() else "完売"
+            seats.append({
+                "seat_type": f"{name} {area}" if area else name,
+                "seat_order": order,
+                "price_min": price_min,
+                "price_max": price_max,
+                "dynamic": is_dynamic,
+                "status": status,
+            })
+    return seats
+
+
+def extract_seat_blocks_text(html: str) -> list[dict]:
+    """
+    (旧方式・予備)ページ全体のテキストから席種ブロックを抽出する。
     各ブロックは概ね次のテキスト構造:
         <席種名見出し>
         基本価格：<価格>円/枚  または  <最小>円～<最大>円/枚
@@ -528,7 +603,7 @@ def build_pivots(df: pd.DataFrame, abbr_map: dict | None = None) -> dict[str, pd
 
     pivots = {}
     for perform_id, group in groups:
-              # 同じ日に複数回取得した場合は、その日の最後の取得結果だけを使う(同日は上書き)
+        # 同じ日に複数回取得した場合は、その日の最後の取得結果だけを使う(同日は上書き)
         group = group.copy()
         group["check_date"] = group["checked_at"].astype(str).str[:10]
         latest = group.groupby("check_date")["checked_at"].transform("max")
