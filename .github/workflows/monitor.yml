@@ -35,14 +35,16 @@ jobs:
           GOOGLE_CREDENTIALS_PATH: service_account.json
 
       # ② 自動: 発売予定シートの ticket_url の試合 → クラブ別ファイル
-      #    失敗しても①の結果のコミットは止めない
+      #    ①が失敗(警告ありを含む)でも実行する。どちらかが失敗すればワークフロー全体は×になる
       - name: Record price history (club files)
+        if: ${{ !cancelled() }}
         run: python price_history.py
-        continue-on-error: true
         env:
           GOOGLE_CREDENTIALS_PATH: service_account.json
 
+      # ①②が失敗(警告ありを含む)でも、取得できた分のCSVはコミットする
       - name: Commit changes
+        if: ${{ !cancelled() }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
