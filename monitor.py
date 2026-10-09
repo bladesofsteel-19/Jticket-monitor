@@ -18,6 +18,7 @@ CSVに履歴として記録するスクリプト。
 import csv
 import os
 import re
+import sys
 import time
 from datetime import datetime, timezone, timedelta
 
@@ -137,17 +138,79 @@ def retry_on_transient_error(func, *args, max_attempts=6, base_delay=5, **kwargs
                 # クォータがリセットされる60秒を待つ方が確実
                 wait = 60 if attempt < max_attempts else 0
                 if attempt < max_attempts:
-                    print(f"[WARN] Google Sheets APIの書き込みクォータ超過。{wait}秒待って再試行します({attempt}/{max_attempts})")
+                    print(f"[RETRY] Google Sheets APIの書き込みクォータ超過。{wait}秒待って再試行します({attempt}/{max_attempts})")
                     time.sleep(wait)
                     continue
                 raise
 
             if status in TRANSIENT_STATUS_CODES and attempt < max_attempts:
                 wait = base_delay * attempt
-                print(f"[WARN] Google Sheets APIが一時的にエラー(status={status})。{wait}秒待って再試行します({attempt}/{max_attempts})")
+                print(f"[RETRY] Google Sheets APIが一時的にエラー(status={status})。{wait}秒待って再試行します({attempt}/{max_attempts})")
                 time.sleep(wait)
                 continue
             raise
+
+
+# ── 警告があれば終了コードを失敗にする仕組み ─────────────────────────
+# 「[WARN]」「[ERROR]」で始まるログ行を数え、終了時に1件でもあれば終了コード1で終わる。
+# これにより、処理は最後まで続けたうえで、GitHub Actions のジョブは「失敗(×)」になり、
+# 「失敗時のみ通知」の設定でメールが届く。
+# 再試行して回復した一時的なエラーは「[RETRY]」で出力するので、数えない。
+WARNING_PREFIXES = ("[WARN]", "[ERROR]")
+
+
+class _WarningCounter:
+    """標準出力をそのまま流しつつ、警告行を記録する"""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._buf = ""
+        self.lines: list[str] = []
+
+    def write(self, s):
+        self._buf += s
+        while "\n" in self._buf:
+            line, self._buf = self._buf.split("\n", 1)
+            if line.lstrip().startswith(WARNING_PREFIXES):
+                self.lines.append(line.strip())
+        return self._stream.write(s)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+_warning_counter: _WarningCounter | None = None
+
+
+def start_warning_counter():
+    """main() の最初に呼ぶ。以降の [WARN]/[ERROR] 行を数える"""
+    global _warning_counter
+    if _warning_counter is None:
+        _warning_counter = _WarningCounter(sys.stdout)
+        sys.stdout = _warning_counter
+
+
+def exit_with_warning_status(script_name: str):
+    """
+    main() の最後に呼ぶ。警告が1件でもあれば、一覧をまとめて表示して終了コード1で終わる。
+    GitHub Actions 上では「::warning::」行として出力し、実行結果の画面(Summary)にも表示されるようにする。
+    """
+    lines = _warning_counter.lines if _warning_counter else []
+    if not lines:
+        print(f"[INFO] {script_name}: 警告なしで終了しました")
+        return
+    sys.stdout.flush()
+    print(f"[SUMMARY] {script_name}: 警告 {len(lines)}件")
+    in_actions = os.environ.get("GITHUB_ACTIONS") == "true"
+    for line in lines:
+        # 「::」で始まる行は Actions のコマンドとして解釈されるため、改行等を除いて1行にする
+        msg = line.replace("%", "%25").replace("\r", "").replace("\n", " ")
+        print(f"::warning title={script_name}::{msg}" if in_actions else f"  - {line}")
+    sys.stdout.flush()
+    sys.exit(1)
 
 
 def get_gspread_client():
@@ -693,6 +756,7 @@ def export_google_sheets(pivots: dict[str, pd.DataFrame]):
 
 
 def main():
+    start_warning_counter()
     targets = load_target_urls()
     abbr_map = load_club_abbr_map()
 
@@ -730,3 +794,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    exit_with_warning_status("monitor.py")

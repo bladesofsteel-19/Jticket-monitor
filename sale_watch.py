@@ -29,7 +29,10 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from monitor import get_gspread_client, retry_on_transient_error, HEADERS, TARGETS_SHEET_NAME, CLUB_ABBR
+from monitor import (
+    get_gspread_client, retry_on_transient_error, HEADERS, TARGETS_SHEET_NAME, CLUB_ABBR,
+    start_warning_counter, exit_with_warning_status,
+)
 
 JST = timezone(timedelta(hours=9))
 SALE_SHEET_NAME = "発売予定"
@@ -81,14 +84,18 @@ def decode_response(resp: requests.Response) -> str:
         return resp.text
 
 
-def fetch(url: str) -> str | None:
+def fetch(url: str, tag: str = "[WARN]") -> str | None:
+    """
+    tag: 失敗時のログの頭。再取得する予定がある途中の失敗は「[RETRY]」にして、
+    警告(=ワークフローの失敗)として数えないようにする。
+    """
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         return decode_response(resp)
     except requests.RequestException as e:
         status = getattr(getattr(e, "response", None), "status_code", None)
-        print(f"[WARN] fetch failed: {url} (status={status}, {type(e).__name__}: {e})")
+        print(f"{tag} fetch failed: {url} (status={status}, {type(e).__name__}: {e})")
         return None
 
 
@@ -1136,18 +1143,21 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
     少し待って再取得する。
     """
     marker = source.get("expect_marker")
+    has_proxy = bool(source.get("proxy_fallback") and PROXY_URL)
+    html = None
     for attempt in range(1, max_attempts + 1):
-        html = fetch(source["url"])
+        # 最後の試行で、かつプロキシでの取り直しも無い場合だけ、失敗を警告として出す
+        last_chance = attempt == max_attempts and not has_proxy
+        html = fetch(source["url"], tag="[WARN]" if last_chance else "[RETRY]")
         if not html:
             if attempt < max_attempts:
                 time.sleep(delay)
-                continue
-            return None
+            continue
 
         if not marker or marker in html:
             return html
 
-        print(f"[WARN] {source['club']}: 目印「{marker}」が見つかりません(内容が間引かれた可能性)。"
+        print(f"[RETRY] {source['club']}: 目印「{marker}」が見つかりません(内容が間引かれた可能性)。"
               f"{delay}秒待って再取得します({attempt}/{max_attempts})")
         if attempt < max_attempts:
             time.sleep(delay)
@@ -1159,6 +1169,8 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
         if proxied and (not marker or marker in proxied):
             return proxied
         print(f"[WARN] {source['club']}: プロキシ経由でも目印「{marker}」が見つかりませんでした")
+    elif html:
+        print(f"[WARN] {source['club']}: {max_attempts}回取得しても目印「{marker}」が見つかりませんでした")
 
     return html  # 最終的に目印が無くても、最後に取得できた内容をそのまま返す(呼び出し側で0件になるだけ)
 
@@ -1263,21 +1275,30 @@ def normalize_venues(rows: list[dict]) -> None:
         r["venue"] = VENUE_FULL_NAMES.get(v, v)
 
 
-def collect_all() -> list[dict]:
+def collect_all() -> tuple[list[dict], list[str]]:
+    """
+    戻り値: (全クラブの行, 今回0件だったクラブの一覧)
+    0件のクラブは、main() で前回の「発売予定」シートの行を引き継ぐ。
+    """
     all_rows = []
+    zero_clubs = []
     for source in SALE_SOURCES:
         # 1クラブで想定外のエラーが起きても、他のクラブの取得とシート書き出しは続ける
         try:
-            all_rows.extend(collect_one(source))
+            club_rows = collect_one(source)
         except Exception as e:
             print(f"[WARN] {source['club']}: 取得中にエラーが発生したためスキップします ({type(e).__name__}: {e})")
+            club_rows = []
+        if not club_rows:
+            zero_clubs.append(source["club"])
+        all_rows.extend(club_rows)
 
     try:
         fill_missing_from_footballlab(all_rows)
     except Exception as e:
         print(f"[WARN] 会場・節の補完に失敗しました ({type(e).__name__}: {e})")
     normalize_venues(all_rows)
-    return all_rows
+    return all_rows, zero_clubs
 
 
 def collect_one(source: dict) -> list[dict]:
@@ -1314,9 +1335,89 @@ def collect_one(source: dict) -> list[dict]:
     return rows
 
 
+# ── 取得0件のクラブは前回の行を引き継ぐ ──────────────────────────
+# 公式サイトの停止(2026/10 清水・京都のランサムウェア被害など)やページの作り替えで0件になると、
+# 「発売予定」シートからそのクラブの行と ticket_url が消え、価格履歴の記録も止まってしまう。
+# そこで、0件だったクラブは前回シートにあった行のうち、試合日がまだ来ていないものをそのまま残す。
+# 確認日時は前回のままにするので、他のクラブより古い日時の行が「引き継いだ行」だと分かる。
+SALE_COLUMNS = ["確認日時", "club", "section", "match_date", "opponent", "venue", "general_sale", "ticket_url"]
+_MD_RE = re.compile(r"(\d{1,2})/(\d{1,2})(?:\s+(\d{1,2}):(\d{2}))?")
+
+
+def _normalize_md_cell(text: str) -> str:
+    """
+    スプレッドシートが日付と解釈して「2026/10/21」「2026/10/14 10:00:00」の形で返した値を、
+    元の「10/21」「10/14 10:00」の形に戻す。日付でない値(「販売中」等)はそのまま返す。
+    """
+    t = re.sub(r"\d{4}[/-]", "", nfkc(text)).replace("-", "/")
+    m = _MD_RE.search(t)
+    if not m:
+        return nfkc(text)
+    md = f"{int(m.group(1))}/{int(m.group(2))}"
+    return f"{md} {int(m.group(3))}:{m.group(4)}" if m.group(3) else md
+
+
+def load_previous_sale_rows() -> list[dict] | None:
+    """前回の「発売予定」シートの行を読む。読めなければ None(引き継ぎはしない)"""
+    import gspread
+    try:
+        gc, sh = get_gspread_client()
+        if sh is None:
+            return None
+        ws = retry_on_transient_error(sh.worksheet, SALE_SHEET_NAME)
+        values = retry_on_transient_error(ws.get_all_values)
+    except gspread.WorksheetNotFound:
+        return []
+    except Exception as e:
+        print(f"[WARN] 前回の「{SALE_SHEET_NAME}」シートを読めないため、0件のクラブの引き継ぎはしません ({e})")
+        return None
+    if not values:
+        return []
+    header = [h.strip() for h in values[0]]
+    rows = []
+    for v in values[1:]:
+        r = {h: (v[i].strip() if i < len(v) else "") for i, h in enumerate(header) if h}
+        if not r.get("club"):
+            continue
+        r["match_date"] = _normalize_md_cell(r.get("match_date", ""))
+        r["general_sale"] = _normalize_md_cell(r.get("general_sale", ""))
+        rows.append(r)
+    return rows
+
+
+def carry_over_zero_clubs(rows: list[dict], zero_clubs: list[str], previous: list[dict] | None) -> list[dict]:
+    """0件だったクラブについて、前回の行のうち試合日が今日以降のものを rows に加えて返す"""
+    if not zero_clubs or previous is None:
+        return rows
+    carried_all = []
+    for club in zero_clubs:
+        carried = []
+        for r in previous:
+            if _key(r.get("club", "")) != _key(club):
+                continue
+            m = _MD_RE.search(r.get("match_date", ""))
+            if not m or is_past_match(int(m.group(1)), int(m.group(2))):
+                continue  # 試合日を過ぎた行は引き継がない
+            carried.append(r)
+        if carried:
+            print(f"[WARN] {club}: 今回0件のため、前回の{len(carried)}行を引き継ぎました"
+                  f"(確認日時 {carried[0].get('確認日時', '不明')} の内容)")
+            carried_all.extend(carried)
+        else:
+            # 前回も今後の試合が無かった(オフシーズン等)なら、取得失敗とは限らないので警告にしない
+            print(f"[INFO] {club}: 今回0件(前回のシートにも今後の試合の行がありません)")
+    if not carried_all:
+        return rows
+    # シート上の並びを SALE_SOURCES の順(クラブごと)に揃える
+    order = {_key(s["club"]): i for i, s in enumerate(SALE_SOURCES)}
+    merged = rows + carried_all
+    merged.sort(key=lambda r: order.get(_key(r.get("club", "")), len(order)))
+    return merged
+
+
 def export_to_sheet(rows: list[dict]):
     if not rows:
-        print("[INFO] 書き出すデータがありません")
+        print("[WARN] 全クラブ0件のため、「発売予定」シートは書き換えずにそのまま残します")
         return
 
     gc, sh = get_gspread_client()
@@ -1331,9 +1432,13 @@ def export_to_sheet(rows: list[dict]):
     except gspread.WorksheetNotFound:
         ws = sh.add_worksheet(title=SALE_SHEET_NAME, rows=200, cols=10)
 
-    df = pd.DataFrame(rows)
     now = datetime.now(JST).strftime("%Y-%m-%d %H:%M")
-    df.insert(0, "確認日時", now)
+    for r in rows:
+        if not r.get("確認日時"):
+            r["確認日時"] = now  # 引き継いだ行は前回の確認日時のまま
+    df = pd.DataFrame(rows)
+    cols = [c for c in SALE_COLUMNS if c in df.columns] + [c for c in df.columns if c not in SALE_COLUMNS]
+    df = df[cols]
 
     retry_on_transient_error(ws.clear)
     from gspread_dataframe import set_with_dataframe
@@ -1455,7 +1560,10 @@ def history_clubs() -> set[str] | None:
 
 
 def main():
-    rows = collect_all()
+    start_warning_counter()
+    rows, zero_clubs = collect_all()
+    if zero_clubs:
+        rows = carry_over_zero_clubs(rows, zero_clubs, load_previous_sale_rows())
     try:
         link_ticket_urls(rows, history_clubs())
     except Exception as e:
@@ -1469,3 +1577,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    exit_with_warning_status("sale_watch.py")

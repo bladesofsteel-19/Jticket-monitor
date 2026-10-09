@@ -32,6 +32,8 @@ from monitor import (
     CLUB_ABBR,
     get_gspread_client,
     retry_on_transient_error,
+    start_warning_counter,
+    exit_with_warning_status,
 )
 
 SALE_SHEET_NAME = "発売予定"
@@ -772,6 +774,7 @@ def clear_past_ticket_urls(sh, today: date) -> None:
 def main():
     from monitor import load_club_abbr_map
 
+    start_warning_counter()
     gc, sh = get_gspread_client()
     if gc is None or sh is None:
         print("[INFO] Google Sheets未設定のため価格履歴の記録をスキップします")
@@ -787,3 +790,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    exit_with_warning_status("price_history.py")
