@@ -292,6 +292,85 @@ def parse_spulse(html: str) -> list[dict]:
     return rows
 
 
+SPULSE_SCHEDULE_URL = "https://www.s-pulse.co.jp/tickets/schedule"
+SPULSE_TOP_URL = "https://www.s-pulse.co.jp/"
+
+
+def parse_spulse_provisional(html: str) -> list[dict]:
+    """
+    暫定版サイト(2026/10/9公開。ランサムウェア被害からの復旧中)のトップページを解析する。
+    「販売中のホームゲームチケット」欄に、販売中の試合だけが次の形で並んでいる:
+        <li class="next_match_ticket__item"><dl>
+          <dt> HOME / <div class="venue">ＩＡＩスタジアム日本平</div> </dt>
+          <dd> <p class="section">第10節</p> <p class="date">10.17 SAT 13:00 KO</p>
+               <p class="card"><span>VS</span> ガンバ大阪</p> </dd>
+          <dd> <a href="https://www.jleague-ticket.jp/sales/perform/2634192/001">チケット購入</a> </dd>
+        </dl></li>
+    一般発売日は書かれていないので general_sale は「販売中」とし、
+    前回の「発売予定」シートに発売日があればそちらを使う(merge_partial_clubs)。
+    チケット購入リンクはそのまま ticket_url にする。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = []
+    for item in soup.select("li.next_match_ticket__item"):
+        date_el = item.select_one("p.date")
+        card_el = item.select_one("p.card")
+        if not date_el or not card_el:
+            continue
+        dm = re.search(r"(\d{1,2})\.(\d{1,2})", nfkc(date_el.get_text(" ", strip=True)))
+        if not dm:
+            continue
+        month, day = int(dm.group(1)), int(dm.group(2))
+        if is_past_match(month, day):
+            continue
+        opponent = re.sub(r"^\s*VS\s*", "", nfkc(card_el.get_text(" ", strip=True)), flags=re.I)
+        venue_el = item.select_one(".venue")
+        section_el = item.select_one("p.section")
+        link = item.find("a", href=PERFORM_LINK_RE)
+        ticket_url = ""
+        if link:
+            lm = PERFORM_LINK_RE.search(link["href"])
+            ticket_url = f"{JLT_BASE}/sales/perform/{lm.group(1)}/{lm.group(2)}"
+        rows.append({
+            "club": "清水エスパルス",
+            "section": extract_section(section_el.get_text(" ", strip=True)) if section_el else "",
+            "match_date": f"{month}/{day}",
+            "opponent": normalize_opponent(opponent),
+            "venue": nfkc(venue_el.get_text(" ", strip=True)) if venue_el else "",
+            "general_sale": "販売中",
+            "ticket_url": ticket_url,
+            "_partial": True,  # 販売中の試合しか載っていない(発売前の試合は前回の行を残す)
+        })
+    return rows
+
+
+def collect_spulse() -> list[dict]:
+    """
+    清水エスパルス。まず通常のチケット販売スケジュールページを試し、
+    無ければ(暫定版サイトの間は)トップページの「販売中のホームゲームチケット」欄を読む。
+    通常ページの取得失敗は暫定版の間は毎回起きるので、警告にはしない([INFO])。
+    """
+    html = fetch(SPULSE_SCHEDULE_URL, tag="[INFO]")
+    if html:
+        rows = parse_spulse(html)
+        if rows:
+            print(f"[INFO] 清水エスパルス: 通常のスケジュールページから{len(rows)}件取得")
+            return rows
+    print("[INFO] 清水エスパルス: 通常のスケジュールページが使えないため、暫定版サイトのトップページを読みます")
+    html = fetch(SPULSE_TOP_URL)
+    if not html:
+        return []
+    if DEBUG_TEXT_DUMP:
+        print("[DEBUG] ---- 清水エスパルス(暫定版トップ) ----")
+        print(repr(nfkc(text_with_img_alts(html))[:1800]))
+        print("[DEBUG] ---- ここまで ----")
+    if "next_match_ticket" not in html:
+        print("[WARN] 清水エスパルス: 暫定版サイトのトップページに「販売中のホームゲームチケット」欄が見つかりません"
+              "(サイトの作りが変わった可能性)")
+        return []
+    return parse_spulse_provisional(html)
+
+
 # 既知のクラブ名(フルネーム)一覧。相手チーム名の特定に使う
 ALL_CLUB_FULL_NAMES = sorted(set(CLUB_ABBR.keys()), key=len, reverse=True)
 
@@ -1082,12 +1161,8 @@ SALE_SOURCES = [
     },
     {
         "club": "清水エスパルス",
-        "url": "https://www.s-pulse.co.jp/tickets/schedule",
-        "parser": parse_spulse,
-        "expect_marker": "一般販売",
-        # GitHub Actions(クラウドのIP)からのアクセスが拒否される場合に、
-        # Google Apps Script 経由の取得に切り替える(SALE_WATCH_PROXY_URL 設定時のみ)
-        "proxy_fallback": True,
+        # 2026/10/9〜 暫定版サイト。通常のスケジュールページ → 暫定版トップページの順に試す
+        "collector": collect_spulse,
     },
     {
         "club": "京都サンガF.C.",
@@ -1095,6 +1170,10 @@ SALE_SOURCES = [
         "parser": parse_sanga,
         "expect_marker": "一般販売",
         "proxy_fallback": True,
+        # 既知の停止中(2026/10/7〜 ランサムウェア被害)。暫定版サイトの販売スケジュールは画像のみで読めない。
+        # この間は取得失敗・前回の行の引き継ぎを警告にしない([INFO])。新しい試合は「発売予定」シートに手で足す
+        # (足した行も次回以降引き継がれる)。通常ページが読めるようになると[WARN]で知らせるので、そうなったらこの行を消す。
+        "known_outage": "公式サイト暫定版のため販売スケジュールを取得できません(2026/10〜)",
     },
     {
         "club": "ヴィッセル神戸",
@@ -1144,11 +1223,13 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
     """
     marker = source.get("expect_marker")
     has_proxy = bool(source.get("proxy_fallback") and PROXY_URL)
+    # 既知の停止中のクラブは、取得失敗を警告にしない
+    fail_tag = "[INFO]" if source.get("known_outage") else "[WARN]"
     html = None
     for attempt in range(1, max_attempts + 1):
         # 最後の試行で、かつプロキシでの取り直しも無い場合だけ、失敗を警告として出す
         last_chance = attempt == max_attempts and not has_proxy
-        html = fetch(source["url"], tag="[WARN]" if last_chance else "[RETRY]")
+        html = fetch(source["url"], tag=fail_tag if last_chance else "[RETRY]")
         if not html:
             if attempt < max_attempts:
                 time.sleep(delay)
@@ -1168,9 +1249,9 @@ def fetch_with_marker_retry(source: dict, max_attempts: int = 3, delay: int = 8)
         proxied = fetch_via_proxy(source["url"])
         if proxied and (not marker or marker in proxied):
             return proxied
-        print(f"[WARN] {source['club']}: プロキシ経由でも目印「{marker}」が見つかりませんでした")
+        print(f"{fail_tag} {source['club']}: プロキシ経由でも目印「{marker}」が見つかりませんでした")
     elif html:
-        print(f"[WARN] {source['club']}: {max_attempts}回取得しても目印「{marker}」が見つかりませんでした")
+        print(f"{fail_tag} {source['club']}: {max_attempts}回取得しても目印「{marker}」が見つかりませんでした")
 
     return html  # 最終的に目印が無くても、最後に取得できた内容をそのまま返す(呼び出し側で0件になるだけ)
 
@@ -1332,6 +1413,15 @@ def collect_one(source: dict) -> list[dict]:
 
     rows = source["parser"](html)
     print(f"[INFO] {source['club']}: {len(rows)}件取得")
+    if source.get("known_outage"):
+        marker = source.get("expect_marker")
+        page_is_back = bool(rows) or (marker and marker in html)
+        if rows:
+            print(f"[WARN] {source['club']}: 通常の販売スケジュールページから{len(rows)}件取得できました。"
+                  f"サイトが復旧したようなので、SALE_SOURCES の known_outage の行を消してください")
+        elif page_is_back:
+            print(f"[WARN] {source['club']}: 販売スケジュールページは表示されていますが、0件でした"
+                  f"(復旧後にページの作りが変わった可能性)")
     return rows
 
 
@@ -1400,8 +1490,11 @@ def carry_over_zero_clubs(rows: list[dict], zero_clubs: list[str], previous: lis
                 continue  # 試合日を過ぎた行は引き継がない
             carried.append(r)
         if carried:
-            print(f"[WARN] {club}: 今回0件のため、前回の{len(carried)}行を引き継ぎました"
-                  f"(確認日時 {carried[0].get('確認日時', '不明')} の内容)")
+            src = next((s for s in SALE_SOURCES if _key(s["club"]) == _key(club)), {})
+            tag = "[INFO]" if src.get("known_outage") else "[WARN]"
+            note = f" ※既知の停止中: {src['known_outage']}" if src.get("known_outage") else ""
+            print(f"{tag} {club}: 今回0件のため、前回の{len(carried)}行を引き継ぎました"
+                  f"(確認日時 {carried[0].get('確認日時', '不明')} の内容){note}")
             carried_all.extend(carried)
         else:
             # 前回も今後の試合が無かった(オフシーズン等)なら、取得失敗とは限らないので警告にしない
@@ -1413,6 +1506,45 @@ def carry_over_zero_clubs(rows: list[dict], zero_clubs: list[str], previous: lis
     merged = rows + carried_all
     merged.sort(key=lambda r: order.get(_key(r.get("club", "")), len(order)))
     return merged
+
+
+def merge_partial_clubs(rows: list[dict], previous: list[dict] | None) -> list[dict]:
+    """
+    「販売中の試合しか載っていない」取得結果(暫定版サイトの清水など。行に _partial が付く)を、
+    前回の「発売予定」シートの行で補う。
+      - 一般発売日が「販売中」の行は、前回の行に「M/D H:MM」の発売日があればそれを使う
+        (価格履歴ファイルのA1「発売日：MM/DD」が「不明」に変わらないように)
+      - 前回の行のうち、今回載っていない今後の試合(発売前の試合)はそのまま残す
+    """
+    partial_clubs = {_key(r["club"]) for r in rows if r.get("_partial")}
+    for r in rows:
+        r.pop("_partial", None)
+    if not partial_clubs or previous is None:
+        return rows
+    for club_key in partial_clubs:
+        prev_rows = [p for p in previous if _key(p.get("club", "")) == club_key]
+        prev_by_md = {p.get("match_date", ""): p for p in prev_rows}
+        cur = [r for r in rows if _key(r["club"]) == club_key]
+        cur_mds = {r["match_date"] for r in cur}
+        filled = 0
+        for r in cur:
+            p = prev_by_md.get(r["match_date"])
+            if r.get("general_sale") == "販売中" and p and _MD_RE.search(p.get("general_sale", "")):
+                r["general_sale"] = p["general_sale"]
+                filled += 1
+        kept = []
+        for p in prev_rows:
+            m = _MD_RE.search(p.get("match_date", ""))
+            if p.get("match_date") in cur_mds or not m or is_past_match(int(m.group(1)), int(m.group(2))):
+                continue
+            kept.append(p)
+        rows.extend(kept)
+        name = cur[0]["club"] if cur else club_key
+        print(f"[INFO] {name}: 販売中の試合のみ掲載のため、発売日{filled}件を前回の行から補い、"
+              f"未掲載の今後の試合{len(kept)}行を前回から残しました")
+    order = {_key(s["club"]): i for i, s in enumerate(SALE_SOURCES)}
+    rows.sort(key=lambda r: order.get(_key(r.get("club", "")), len(order)))
+    return rows
 
 
 def export_to_sheet(rows: list[dict]):
@@ -1562,8 +1694,11 @@ def history_clubs() -> set[str] | None:
 def main():
     start_warning_counter()
     rows, zero_clubs = collect_all()
+    need_previous = zero_clubs or any(r.get("_partial") for r in rows)
+    previous = load_previous_sale_rows() if need_previous else None
+    rows = merge_partial_clubs(rows, previous)
     if zero_clubs:
-        rows = carry_over_zero_clubs(rows, zero_clubs, load_previous_sale_rows())
+        rows = carry_over_zero_clubs(rows, zero_clubs, previous)
     try:
         link_ticket_urls(rows, history_clubs())
     except Exception as e:
