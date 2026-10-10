@@ -458,7 +458,12 @@ def extract_seat_blocks_structured(html: str) -> list[dict]:
             continue
         price_min = pm.group(1).replace(",", "")
         price_max = (pm.group(2) or pm.group(1)).replace(",", "")
-        is_dynamic = "変動" in dt_text
+        # 変動価格の印は、席種ごとの販売スケジュールにある売り方(券種)の名前に付いている
+        # (ヴェルディ:「■《変動》一般発売／ＱＲチケット（Ｊチケ）」。会員割引には付かない)。
+        # 注意書きの「価格は変動する場合があります」等に反応しないよう、売り方の名前(.info-schedule-list .title)だけを見る。
+        # 席種名の欄(dt)に「変動」がある場合も変動価格とみなす(以前からの判定)
+        sale_titles = [t.get_text(" ", strip=True) for t in dd.select(".info-schedule-list .title")]
+        is_dynamic = "変動" in dt_text or any("変動" in t for t in sale_titles)
         try:
             order = int(dt.get("data-mark-no"))
         except (TypeError, ValueError):
