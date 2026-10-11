@@ -419,13 +419,22 @@ def write_match_sheet(sh, name_to_ws: dict, title_prefix: str, title: str,
                       seats: list[dict], today: date, label: str, match_day: date) -> tuple[bool, bool]:
     """
     1試合分を書き込む。戻り値: (シートを新規作成したか, 行を追記・更新したか)
-    既存シートはシート名の先頭(「MMDD 相手」)で探すので、後から会場名が変わっても同じシートに書く。
+    既存シートはシート名の先頭(「MMDD」)で探すので、後から相手・会場の表記が変わっても同じシートに書く。
     """
+    # 既存シートはシート名の先頭4桁(MMDD)で探す。1クラブ・1シーズンで同じ日に2試合は無いので、日付だけで1試合に決まる。
+    # 相手やスタジアムの略称が後から登録された場合(フルネーム → 略称)も同じシートを使い続け、シート名を今の表記に付け直す。
     ws = None
+    mmdd = title_prefix[:4]
     for t, w in name_to_ws.items():
-        if t == title_prefix or t.startswith(title_prefix + "_"):
+        if re.match(r"^\d{4} ", t) and t[:4] == mmdd:
             ws = w
             break
+    if ws is not None and ws.title != title and title not in name_to_ws:
+        old_title = ws.title
+        retry_on_transient_error(ws.update_title, title)
+        name_to_ws.pop(old_title, None)
+        name_to_ws[title] = ws
+        print(f"[INFO] 価格履歴: シート名を変更しました「{old_title}」→「{title}」")
 
     created = False
     if ws is None:
