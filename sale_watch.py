@@ -371,6 +371,200 @@ def collect_spulse() -> list[dict]:
     return parse_spulse_provisional(html)
 
 
+# ── 柏レイソルのアウェイ戦の発売日(別シート「柏アウェイ発売」) ──────────────
+# 柏はホームクラブとしては対象外だが、柏のアウェイ戦の発売日を一覧にしたいので、
+# 柏の試合日程ページの各試合の「インフォ」ページにある「チケット販売について（鹿島HP）9/25(金)10:00発売」を読み、
+# 「柏アウェイ発売」シート(試合日 / 節 / 相手 / スタジアム / 発売日)に書き出す。「発売予定」シートには混ぜない。
+# 発売日の決め方: 柏のインフォページ → 無ければ「発売予定」シートのホームクラブの行 → 無ければ前回のシートの値 → 空欄
+REYSOL_RESULTS_URL = "https://www.reysol.co.jp/game/results/"
+REYSOL_BASE = "https://www.reysol.co.jp"
+REYSOL_SHEET_NAME = "柏アウェイ発売"
+REYSOL_HEADER = ["試合日", "節", "相手", "スタジアム", "発売日"]
+REYSOL_SALE_RE = re.compile(r"チケット販売について[^\n]*?(\d{1,2}/\d{1,2})\s*\([^)]*\)\s*(\d{1,2}:\d{2})?\s*発売")
+WEEKDAYS_JA = "月火水木金土日"
+
+
+def season_date(month: int, day: int, today: date | None = None) -> date | None:
+    """年の無い「M/D」を、今日の属するシーズン(7月〜翌6月)の日付にする"""
+    today = today or datetime.now(JST).date()
+    season_start = today.year if today.month >= 7 else today.year - 1
+    try:
+        return date(season_start if month >= 7 else season_start + 1, month, day)
+    except ValueError:
+        return None
+
+
+def parse_reysol_schedule(html: str) -> list[dict]:
+    """
+    試合日程ページから、柏のアウェイ戦(今後の試合)を集める。ACL・天皇杯・ルヴァンカップも含む
+    (ACLのアウェイは発売日が無いことが多いが、試合日の一覧として載せる)。
+      <div class="game-item">
+        <div class="game-label away">AWAY</div> <div class="game-section-text">第12節</div>
+        <div class="game-stadium-text">メルスタ</div> <div class="date">10月24日</div>
+        <div class="team-name">鹿島アントラーズ</div> <a href="/game/results/202627/1024i.php">インフォ</a>
+    大会名は直前の見出しから取る。日付が「2月13日or14日」のような未確定の試合は1つ目の日付を使う。
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    matches = []
+    for item in soup.select("div.game-item"):
+        label = item.select_one(".game-label")
+        if not label or nfkc(label.get_text()).upper() != "AWAY":
+            continue
+        date_el = item.select_one(".game-date .date")
+        team_el = item.select_one(".team-name")
+        if not (date_el and team_el):
+            continue
+        heading = item.find_previous(["h2", "h3", "h4"])
+        heading_text = nfkc(heading.get_text(" ", strip=True)) if heading else ""
+        dm = re.search(r"(\d{1,2})月(\d{1,2})日", nfkc(date_el.get_text()))
+        if not dm:
+            continue
+        month, day = int(dm.group(1)), int(dm.group(2))
+        if is_past_match(month, day):
+            continue
+        sec_el = item.select_one(".game-section-text")
+        sec_text = nfkc(sec_el.get_text(" ", strip=True)) if sec_el else ""
+        section = extract_section(heading_text + " " + sec_text)
+        # 他の大会と区別できるよう、リーグ戦は「J1リーグ 第16節」とする
+        if re.fullmatch(r"第\d+節", section) and "J1" in heading_text:
+            section = f"J1リーグ {section}"
+        section = section or f"{heading_text} {sec_text}".strip()
+        link = item.find("a", href=re.compile(r"\d{4}i\.php"))
+        stadium_el = item.select_one(".game-stadium-text")
+        matches.append({
+            "home": nfkc(team_el.get_text(" ", strip=True)),
+            "month": month, "day": day,
+            "match_date": f"{month}/{day}",
+            "section": section,
+            "stadium": nfkc(stadium_el.get_text(" ", strip=True)) if stadium_el else "",
+            "info_url": (link["href"] if link["href"].startswith("http") else REYSOL_BASE + link["href"]) if link else "",
+        })
+    return matches
+
+
+def parse_reysol_info(html: str) -> tuple[str | None, str]:
+    """インフォページから (発売日時「M/D H:MM」または None, 会場の正式名称) を読む"""
+    soup = BeautifulSoup(html, "html.parser")
+    text = re.sub(r"[ \t]*\n[ \t]*", " ", nfkc(soup.get_text("\n")))  # リンク文字列と日付のバッジが別の行でも読めるように
+    m = REYSOL_SALE_RE.search(text)
+    sale = None
+    if m:
+        sale = format_sale_datetime(f"{m.group(1)} {m.group(2)}" if m.group(2) else m.group(1))
+    venue_el = soup.select_one(".game-info-stadium")
+    return sale, (nfkc(venue_el.get_text(" ", strip=True)) if venue_el else "")
+
+
+def sale_display(sale: str, match_day: date) -> str:
+    """「11/13 12:00」→「11/13(金) 12:00」。発売日は試合日より前なので、試合日以前の直近の年で曜日を求める"""
+    m = _MD_RE.search(re.sub(r"\([^)]*\)", "", sale or ""))  # 既に曜日付き(前回の値)でも読めるように
+    if not m:
+        return sale or ""
+    month, day = int(m.group(1)), int(m.group(2))
+    d = None
+    for year in (match_day.year, match_day.year - 1):
+        try:
+            cand = date(year, month, day)
+        except ValueError:
+            continue
+        if cand <= match_day:
+            d = cand
+            break
+    wd = f"({WEEKDAYS_JA[d.weekday()]})" if d else ""
+    return f"{month}/{day}{wd}" + (f" {int(m.group(3))}:{m.group(4)}" if m.group(3) else "")
+
+
+def load_previous_reysol_sales() -> dict[str, str]:
+    """前回の「柏アウェイ発売」シートの {試合日 'M/D': 発売日} (発売後に柏のページから日付が消えた場合に使う)"""
+    import gspread
+    try:
+        gc, sh = get_gspread_client()
+        if sh is None:
+            return {}
+        values = retry_on_transient_error(sh.worksheet(REYSOL_SHEET_NAME).get_all_values)
+    except gspread.WorksheetNotFound:
+        return {}
+    except Exception as e:
+        print(f"[WARN] 前回の「{REYSOL_SHEET_NAME}」シートを読めませんでした ({e})")
+        return {}
+    result = {}
+    for v in values[1:]:
+        if len(v) >= 5 and v[4].strip():
+            md = _normalize_md_cell(v[0])
+            if _MD_RE.search(md):
+                result[_MD_RE.search(md).group(0).split()[0]] = v[4].strip()
+    return result
+
+
+def collect_reysol_away(sale_rows: list[dict]) -> list[list] | None:
+    """「柏アウェイ発売」シートに書く表(見出し行を除く)。取得できなければ None(シートを書き換えない)"""
+    html = fetch(REYSOL_RESULTS_URL)
+    if not html:
+        return None
+    matches = parse_reysol_schedule(html)
+    if not matches:
+        print("[WARN] 柏レイソル: 試合日程ページからアウェイ戦を読み取れませんでした(ページの作りが変わった可能性)")
+        return None
+    by_home = {(_key(r.get("club", "")), r.get("match_date", "")): r for r in sale_rows}
+    previous = load_previous_reysol_sales()
+    table = []
+    counts = {"柏": 0, "ホーム": 0, "前回": 0, "未定": 0}
+    for mt in matches:
+        sale, venue = None, ""
+        if mt["info_url"]:
+            # 発売日が未定の試合はインフォページ自体が無い(File not found)ので、警告にはしない
+            page = fetch(mt["info_url"], tag="[INFO]")
+            time.sleep(1)
+            if page:
+                sale, venue = parse_reysol_info(page)
+        if sale:
+            counts["柏"] += 1
+        else:
+            home_row = by_home.get((_key(mt["home"]), mt["match_date"]))
+            if home_row and _MD_RE.search(home_row.get("general_sale", "")):
+                sale = home_row["general_sale"]
+                counts["ホーム"] += 1
+            elif previous.get(mt["match_date"]):
+                sale = previous[mt["match_date"]]
+                counts["前回"] += 1
+            else:
+                counts["未定"] += 1
+        match_day = season_date(mt["month"], mt["day"])
+        table.append([
+            f"{match_day:%Y/%m/%d}" if match_day else mt["match_date"],
+            mt["section"],
+            mt["home"],
+            venue or mt["stadium"],
+            sale_display(sale, match_day) if (sale and match_day) else (sale or ""),
+        ])
+    table.sort(key=lambda row: str(row[0]))  # 大会をまたいで試合日順に並べる
+    # スタジアムは「スタジアム略称」シートの正式名称に揃える(インフォページが無い試合は日程ページの略称しか無いため)
+    venue_rows = [{"venue": row[3]} for row in table]
+    normalize_venues(venue_rows)
+    for row, v in zip(table, venue_rows):
+        row[3] = v["venue"]
+    print(f"[INFO] 柏レイソル(アウェイ): {len(table)}試合"
+          f"(発売日: 柏のページ {counts['柏']} / ホームクラブの発売予定 {counts['ホーム']} / "
+          f"前回の値 {counts['前回']} / 未定 {counts['未定']})")
+    return table
+
+
+def export_reysol_sheet(table: list[list]) -> None:
+    gc, sh = get_gspread_client()
+    if sh is None:
+        return
+    import gspread
+    try:
+        ws = retry_on_transient_error(sh.worksheet, REYSOL_SHEET_NAME)
+    except gspread.WorksheetNotFound:
+        ws = retry_on_transient_error(sh.add_worksheet, title=REYSOL_SHEET_NAME, rows=60, cols=len(REYSOL_HEADER))
+    # 値だけ消して書き直す(列幅・表示形式など、シート側で付けた書式は残る)。
+    # USER_ENTERED なので試合日「2026/12/16」は日付として入る。発売日「11/13(金) 12:00」は文字のまま。
+    retry_on_transient_error(ws.clear)
+    retry_on_transient_error(ws.update, values=[REYSOL_HEADER] + table, range_name="A1",
+                             value_input_option="USER_ENTERED")
+    print(f"[INFO] 「{REYSOL_SHEET_NAME}」シートに{len(table)}試合を書き出しました")
+
+
 # 既知のクラブ名(フルネーム)一覧。相手チーム名の特定に使う
 ALL_CLUB_FULL_NAMES = sorted(set(CLUB_ABBR.keys()), key=len, reverse=True)
 
@@ -890,14 +1084,13 @@ def parse_sale_datetime(cell: str, default_time: str | None = None) -> str | Non
 def is_past_match(month: int, day: int, today: date | None = None) -> bool:
     """
     年の書かれていない「M/D」が、今日より前の試合かどうかを判定する。
-    シーズンが年をまたぐため、6か月以上離れた月は前年/翌年の試合とみなす。
+    Jリーグは7月〜翌6月のシーズン制なので、今日の属するシーズンの中の日付として年を決める
+    (例: 2026/10 時点で「5/15」は 2027/5/15、「8/14」は 2026/8/14)。
+    (以前は「6か月以上離れた月は前年/翌年」としていたため、10月時点で翌4〜6月の試合を過去と誤判定していた)
     """
     today = today or datetime.now(JST).date()
-    year = today.year
-    if month < today.month - 6:
-        year += 1
-    elif month > today.month + 6:
-        year -= 1
+    season_start = today.year if today.month >= 7 else today.year - 1
+    year = season_start if month >= 7 else season_start + 1
     try:
         return date(year, month, day) < today
     except ValueError:
@@ -1694,11 +1887,11 @@ def history_clubs() -> set[str] | None:
 def main():
     start_warning_counter()
     rows, zero_clubs = collect_all()
-    need_previous = zero_clubs or any(r.get("_partial") for r in rows)
-    previous = load_previous_sale_rows() if need_previous else None
+    previous = load_previous_sale_rows()
     rows = merge_partial_clubs(rows, previous)
     if zero_clubs:
         rows = carry_over_zero_clubs(rows, zero_clubs, previous)
+
     try:
         link_ticket_urls(rows, history_clubs())
     except Exception as e:
@@ -1708,6 +1901,14 @@ def main():
     # 見つけた試合ページURLは「発売予定」シートの ticket_url 列に書くだけで、「対象試合」シートには入れない。
     # 価格の取得とクラブ別ファイルへの記録は、monitor.py(price_history.py)がこの列を読んで行う。
     export_to_sheet(rows)
+
+    # 柏のアウェイ戦の発売日を別シートに(「発売予定」とは独立。失敗しても上の書き出しには影響しない)
+    try:
+        table = collect_reysol_away(rows)
+        if table is not None:
+            export_reysol_sheet(table)
+    except Exception as e:
+        print(f"[WARN] 「{REYSOL_SHEET_NAME}」シートの更新に失敗しました ({type(e).__name__}: {e})")
 
 
 if __name__ == "__main__":
