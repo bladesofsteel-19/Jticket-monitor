@@ -84,13 +84,89 @@ def decode_response(resp: requests.Response) -> str:
         return resp.text
 
 
+# ── 中間証明書が欠けているサイトへの対応 ────────────────────────────
+# サーバーが中間証明書を送ってこないサイト(2026/10 清水・京都の暫定版サイト)は、ブラウザでは開けるが
+# Python では「unable to get local issuer certificate」で失敗する。ブラウザは証明書に書かれた
+# 「発行元の証明書の置き場所(AIA)」から中間証明書を自分で取ってきて補っているので、同じことをする。
+# 補うのは中間証明書だけで、検証そのもの(信頼できるルート証明書までのつながり・ホスト名)は通常どおり行う。
+_AIA_BUNDLES: dict[str, str | None] = {}
+AIA_BASE_BUNDLE: str | None = None  # テスト用。None なら certifi の証明書一覧を使う
+
+
+def _aia_bundle_for(host: str, port: int = 443) -> str | None:
+    """欠けた中間証明書を取ってきて、certifi の一覧に足した証明書ファイルのパスを返す。できなければ None"""
+    if host in _AIA_BUNDLES:
+        return _AIA_BUNDLES[host]
+    _AIA_BUNDLES[host] = None
+    try:
+        import ssl
+        import tempfile
+        import certifi
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding, pkcs7
+        from cryptography.x509.oid import AuthorityInformationAccessOID, ExtensionOID
+
+        # サーバー証明書を受け取るだけ(中身の確認用。ここでは検証しないが、実際の取得は下で検証つきで行う)
+        leaf = x509.load_pem_x509_certificate(ssl.get_server_certificate((host, port), timeout=15).encode())
+        aia = leaf.extensions.get_extension_for_oid(ExtensionOID.AUTHORITY_INFORMATION_ACCESS).value
+        urls = [d.access_location.value for d in aia
+                if d.access_method == AuthorityInformationAccessOID.CA_ISSUERS]
+        pems = []
+        for ca_url in urls:
+            data = requests.get(ca_url, headers=HEADERS, timeout=15).content
+            try:
+                certs = [x509.load_der_x509_certificate(data)]
+            except ValueError:
+                try:
+                    certs = [x509.load_pem_x509_certificate(data)]
+                except ValueError:
+                    certs = pkcs7.load_der_pkcs7_certificates(data)
+            pems += [c.public_bytes(Encoding.PEM).decode() for c in certs]
+        if not pems:
+            return None
+        base = open(AIA_BASE_BUNDLE or certifi.where(), encoding="utf-8").read()
+        # 取ってきた中間証明書が、信頼できるルート証明書までつながっていること(とホスト名)を先に確かめる。
+        # 確かめずに証明書ファイルに足すと、その中間証明書自体が「信頼済み」として扱われ、
+        # 偽の中間証明書を置かれた場合でも通ってしまうため。
+        from cryptography.x509 import DNSName
+        from cryptography.x509.verification import PolicyBuilder, Store
+        roots = x509.load_pem_x509_certificates(base.encode())
+        intermediates = [x509.load_pem_x509_certificate(p.encode()) for p in pems]
+        verifier = PolicyBuilder().store(Store(roots)).build_server_verifier(DNSName(host))
+        chain = verifier.verify(leaf, intermediates)  # つながらなければ例外(VerificationError)
+        used = [c.public_bytes(Encoding.PEM).decode() for c in chain[1:-1]]  # サーバー証明書とルートを除く
+        if not used:
+            return None
+        f = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False, encoding="utf-8")
+        f.write(base + "\n" + "\n".join(used))
+        f.close()
+        _AIA_BUNDLES[host] = f.name
+        print(f"[INFO] {host}: サーバーが送らない中間証明書を補いました({len(used)}件, {', '.join(urls)})")
+        return f.name
+    except Exception as e:
+        print(f"[INFO] {host}: 中間証明書を補えませんでした ({type(e).__name__}: {e})")
+        return None
+
+
+def _is_missing_intermediate(e: Exception) -> bool:
+    return isinstance(e, requests.exceptions.SSLError) and "unable to get local issuer certificate" in str(e)
+
+
 def fetch(url: str, tag: str = "[WARN]") -> str | None:
     """
     tag: 失敗時のログの頭。再取得する予定がある途中の失敗は「[RETRY]」にして、
     警告(=ワークフローの失敗)として数えないようにする。
     """
+    from urllib.parse import urlsplit
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=15)
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+        except requests.exceptions.SSLError as e:
+            parts = urlsplit(url)
+            bundle = _aia_bundle_for(parts.hostname, parts.port or 443) if _is_missing_intermediate(e) else None
+            if not bundle:
+                raise
+            resp = requests.get(url, headers=HEADERS, timeout=15, verify=bundle)
         resp.raise_for_status()
         return decode_response(resp)
     except requests.RequestException as e:
